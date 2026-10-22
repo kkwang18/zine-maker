@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { readDrag } from './components/dragItem'
 import { FlipText } from './components/FlipText'
 import { PhotoToolbar, ShapeToolbar, TextToolbar } from './components/ItemToolbar'
 import { LayoutPicker } from './components/LayoutPicker'
 import { PageActions } from './components/PageActions'
 import { PhotoTray } from './components/PhotoTray'
+import { PhotoViewer } from './components/PhotoViewer'
 import { Preview } from './components/Preview'
 import { SurfaceView, type SurfaceEditor } from './components/SurfaceView'
 import { forget, loadPhoto, showable, stored } from './lib/analyze'
@@ -25,6 +26,7 @@ import {
   moveFree,
   moveSpread,
   placePhoto,
+  placesOf,
   removePhoto as withoutPhoto,
   removeShape,
   removeSpread,
@@ -101,12 +103,52 @@ function download(blob: Blob, name: string) {
   setTimeout(() => URL.revokeObjectURL(link.href), 10_000)
 }
 
-/** A panel section with a folder-tab label. */
-function Section({ title, children }: { title: string; children: ReactNode }) {
+type PanelSection = 'project' | 'style' | 'cover' | 'numbers' | 'back' | 'photos'
+
+/** Which panel sections are open is remembered per browser; only Photos starts open. */
+const OPEN_SECTIONS = 'zine-maker:open-sections'
+
+function savedOpenSections(): Set<PanelSection> {
+  try {
+    const saved = localStorage.getItem(OPEN_SECTIONS)
+    if (saved) return new Set(JSON.parse(saved) as PanelSection[])
+  } catch {
+    // No storage (private window, blocked site data): fall back to the default.
+  }
+  return new Set(['photos'])
+}
+
+/**
+ * A panel section with a folder-tab label that opens and closes it. Closed,
+ * it shows a one-line summary of its settings instead.
+ */
+function Section({
+  title,
+  summary,
+  open,
+  onToggle,
+  children,
+}: {
+  title: string
+  summary?: string
+  open: boolean
+  onToggle: () => void
+  children: ReactNode
+}) {
+  const body = useId()
   return (
-    <section className="section">
-      <h2 className="tab">{title}</h2>
-      <div className="section__body">{children}</div>
+    <section className={`section${open ? ' section--open' : ''}`}>
+      <h2 className="section__head">
+        <button className="tab section__toggle" aria-expanded={open} aria-controls={body} onClick={onToggle}>
+          <span className="section__chevron" aria-hidden="true" />
+          {title}
+        </button>
+        {!open && summary && <span className="section__summary">{summary}</span>}
+      </h2>
+      {/* Kept mounted while closed, so its fields can still be focused from the page. */}
+      <div id={body} className="section__body" hidden={!open}>
+        {children}
+      </div>
     </section>
   )
 }
@@ -131,6 +173,8 @@ function App() {
   const [exporting, setExporting] = useState(false)
   const [exportError, setExportError] = useState('')
   const [previewing, setPreviewing] = useState(false)
+  // A photo open in the viewer, whole and uncropped.
+  const [viewing, setViewing] = useState<string | null>(null)
   const [showGuides, setShowGuides] = useState(false)
   // The digital edition, once made; cleared whenever the zine changes so it's never stale.
   const [shareFile, setShareFile] = useState<File | null>(null)
@@ -140,10 +184,13 @@ function App() {
   // (with `pending` set when it's standing between someone and a download).
   const [issues, setIssues] = useState<Issue[]>([])
   const [checking, setChecking] = useState<{ target: ExportTarget; pending: boolean } | null>(null)
-  const [downloadMenu, setDownloadMenu] = useState(false)
+  const [exportMenu, setExportMenu] = useState(false)
+  // The top bar slides away while scrolling down through the pages, and back on the way up.
+  const [barHidden, setBarHidden] = useState(false)
   // Autosave: nothing is written until the last session has been read back in.
   const [ready, setReady] = useState(false)
   const [saveNote, setSaveNote] = useState('')
+  const [openSections, setOpenSections] = useState(savedOpenSections)
   const book = useRef<HTMLDivElement>(null)
   const input = useRef<HTMLInputElement>(null)
   const projectInput = useRef<HTMLInputElement>(null)
@@ -186,6 +233,7 @@ function App() {
   const byId = useMemo(() => new Map(photos.map((p) => [p.id, p])), [photos])
   const surfaces = useMemo(() => (draft ? renderDraft(draft, byId, paper) : []), [draft, byId, paper])
   const similar = useMemo(() => lookAlikes(photos), [photos])
+  const places = useMemo(() => placesOf(draft), [draft])
 
   /** Apply a change to the zine. Most changes clear the selection; moving things keeps it. */
   const edit = (change: (d: Draft) => Draft, keep: Selection | null = null) => {
@@ -530,7 +578,6 @@ function App() {
     }
   }
 
-  /** The print PDF, or Instagram slides, depending on the format. */
   /** Where things go by default: Instagram slides, or the home-printer PDF. */
   const defaultTarget: ExportTarget = paper === 'instagram' ? 'instagram' : 'home'
 
@@ -542,9 +589,35 @@ function App() {
 
   const warnings = issues.filter((i) => i.severity === 'warn').length
 
+  // Hide the top bar on the way down the pages, bring it back on the way up.
+  useEffect(() => {
+    let last = window.scrollY
+    const onScroll = () => {
+      const y = window.scrollY
+      if (Math.abs(y - last) < 8) return
+      setBarHidden(y > last && y > 160)
+      last = y
+    }
+    window.addEventListener('scroll', onScroll, { passive: true })
+    return () => window.removeEventListener('scroll', onScroll)
+  }, [])
+
+  // The export menu closes on a click anywhere else.
+  useEffect(() => {
+    if (!exportMenu) return
+    const close = (e: PointerEvent) => {
+      if (!(e.target as Element).closest('.stage__bar')) setExportMenu(false)
+    }
+    window.addEventListener('pointerdown', close)
+    return () => window.removeEventListener('pointerdown', close)
+  }, [exportMenu])
+
+  // Never hide it while something in it is open or under way.
+  const barShown = !barHidden || exportMenu || Boolean(checking || shareFile || shareNote) || exporting || sharing
+
   /** Check first; if anything looks wrong, show it before downloading. */
   const requestDownload = (target: ExportTarget) => {
-    setDownloadMenu(false)
+    setExportMenu(false)
     if (!book.current) return
     const found = preflight(book.current, surfaces, byId, paper, target)
     if (found.some((i) => i.severity === 'warn')) {
@@ -683,8 +756,8 @@ function App() {
   // Delete removes, arrow keys nudge (Shift for bigger steps).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      // In a text field, leave undo to the field itself.
-      if (isTyping()) return
+      // In a text field, leave undo to the field itself; a full-screen view has its own keys.
+      if (isTyping() || previewing || viewing) return
       const mod = e.metaKey || e.ctrlKey
       if (mod && e.key.toLowerCase() === 'z') {
         e.preventDefault()
@@ -774,11 +847,33 @@ function App() {
   }
 
   // Clicking text on a page jumps to the field that edits it.
+  const toggleSection = (id: PanelSection) =>
+    setOpenSections((prev) => {
+      const next = new Set(prev)
+      if (!next.delete(id)) next.add(id)
+      return next
+    })
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(OPEN_SECTIONS, JSON.stringify([...openSections]))
+    } catch {
+      // Not remembered this time; nothing else depends on it.
+    }
+  }, [openSections])
+
   const editText = (kind: TextKind) => {
-    const field = { title: titleField, byline: bylineField, colophon: backField }[kind].current
-    field?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
-    field?.focus()
+    // Open the section that holds the field first, then focus it once it's shown.
+    const section = kind === 'colophon' ? 'back' : 'cover'
+    setOpenSections((prev) => (prev.has(section) ? prev : new Set([...prev, section])))
+    setTimeout(() => {
+      const field = { title: titleField, byline: bylineField, colophon: backField }[kind].current
+      field?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+      field?.focus()
+    })
   }
+
+  const section = (id: PanelSection) => ({ open: openSections.has(id), onToggle: () => toggleSection(id) })
 
   const pageVars = {
     '--page': PAGE_COLORS[pageColor].page,
@@ -795,7 +890,7 @@ function App() {
           <p className="brand__line">Photos in, zine out.</p>
         </header>
 
-        <Section title="Project">
+        <Section title="Project" {...section('project')}>
           <div className="pills">
             <button className="pill" disabled={!photos.length} onClick={saveProjectFile}>
               Save project
@@ -821,7 +916,7 @@ function App() {
           <p className="hint">☞ {saveNote || 'Your work saves in this browser as you go. Save a project file to keep a copy or move computers.'}</p>
         </Section>
 
-        <Section title="Style">
+        <Section title="Style" summary={`${STYLES[zineStyle].label} · ${PAPER[paper].label}`} {...section('style')}>
           <div className="styles">
             {(Object.keys(STYLES) as ZineStyle[]).map((s) => (
               <button
@@ -880,7 +975,7 @@ function App() {
           {draft && <p className="hint">☞ {lengthNote}</p>}
         </Section>
 
-        <Section title="Cover">
+        <Section title="Cover" summary={title.trim() || 'Untitled'} {...section('cover')}>
           <label className="field">
             <span>Title</span>
             <input
@@ -921,7 +1016,11 @@ function App() {
           </label>
         </Section>
 
-        <Section title="Page numbers">
+        <Section
+          title="Page numbers"
+          summary={[folios.numbers ? 'Numbered' : 'Off', folios.running.trim()].filter(Boolean).join(' · ')}
+          {...section('numbers')}
+        >
           <label className="toggle">
             <input
               type="checkbox"
@@ -967,7 +1066,7 @@ function App() {
           </label>
         </Section>
 
-        <Section title="Back">
+        <Section title="Back" summary={backText.trim() || 'Default line'} {...section('back')}>
           <label className="field">
             <span>Text</span>
             <textarea
@@ -982,7 +1081,11 @@ function App() {
           {!backText.trim() && <p className="hint">☞ Leave empty to use the line shown.</p>}
         </Section>
 
-        <Section title="Photos">
+        <Section
+          title="Photos"
+          summary={photos.length ? `${photos.length} photo${photos.length === 1 ? '' : 's'}` : 'None yet'}
+          {...section('photos')}
+        >
           <div className="pills">
             <button className="pill pill--solid" onClick={() => input.current?.click()}>
               Add photos
@@ -1018,10 +1121,11 @@ function App() {
 
           <PhotoTray
             photos={photos}
-            draft={draft}
+            places={places}
             lookAlikes={similar}
             selectedId={selected?.type === 'photo' ? selected.id : null}
             onSelect={clickTrayPhoto}
+            onView={setViewing}
             onRemove={removePhoto}
           />
         </Section>
@@ -1034,12 +1138,12 @@ function App() {
         }}
       >
         {draft && (
-          <div className="stage__bar" data-keep-selection>
-            <button className="pill pill--small" disabled={!history.canUndo} onClick={undo} title="Undo (⌘Z)">
-              ↶ Undo
+          <div className={`stage__bar${barShown ? '' : ' stage__bar--hidden'}`} data-keep-selection>
+            <button className="pill pill--small" disabled={!history.canUndo} onClick={undo} title="Undo (⌘Z)" aria-label="Undo">
+              ↶<span className="wide-only"> Undo</span>
             </button>
-            <button className="pill pill--small" disabled={!history.canRedo} onClick={redo} title="Redo (⇧⌘Z)">
-              ↷ Redo
+            <button className="pill pill--small" disabled={!history.canRedo} onClick={redo} title="Redo (⇧⌘Z)" aria-label="Redo">
+              ↷<span className="wide-only"> Redo</span>
             </button>
             <button
               className="pill pill--small"
@@ -1054,40 +1158,69 @@ function App() {
             <button className="pill" onClick={() => setPreviewing(true)}>
               Preview
             </button>
-            <button className="pill" disabled={sharing} onClick={prepareShare} title="A PDF to read on screen, for sending to people">
-              {sharing ? 'Preparing…' : 'Share'}
-            </button>
-            <button
-              className="pill"
-              aria-expanded={Boolean(checking)}
-              onClick={() => setChecking(checking ? null : { target: defaultTarget, pending: false })}
-              title="Check for problems before printing or posting"
-            >
-              Check{warnings > 0 && <span className="badge">{warnings}</span>}
-            </button>
             <button
               className="pill pill--solid"
-              disabled={exporting}
-              aria-expanded={downloadMenu}
-              onClick={() => (paper === 'instagram' ? requestDownload('instagram') : setDownloadMenu(!downloadMenu))}
+              disabled={exporting || sharing}
+              aria-expanded={exportMenu}
+              onClick={() => setExportMenu(!exportMenu)}
             >
-              {exporting ? 'Making…' : paper === 'instagram' ? 'Download slides' : 'Download PDF ▾'}
+              {exporting ? 'Making…' : sharing ? 'Preparing…' : 'Export ▾'}
+              {warnings > 0 && <span className="badge">{warnings}</span>}
             </button>
-            {downloadMenu && (
+            {exportMenu && (
               <div className="share-panel download-menu" role="menu">
-                <button role="menuitem" className="download-option" onClick={() => requestDownload('home')}>
-                  <strong>For a home printer</strong>
-                  <span>
-                    {spreadCount === 3
-                      ? 'One sheet, laid out to fold into the zine, with a folding guide.'
-                      : 'Double-sided sheets to stack, fold and staple, with instructions.'}
-                  </span>
+                {paper === 'instagram' ? (
+                  <button role="menuitem" className="download-option" onClick={() => requestDownload('instagram')}>
+                    <strong>Download slides</strong>
+                    <span>Every page at 1080 × 1350, ready to post as a carousel.</span>
+                  </button>
+                ) : (
+                  <>
+                    <button role="menuitem" className="download-option" onClick={() => requestDownload('home')}>
+                      <strong>PDF for a home printer</strong>
+                      <span>
+                        {spreadCount === 3
+                          ? 'One sheet, laid out to fold into the zine, with a folding guide.'
+                          : 'Double-sided sheets to stack, fold and staple, with instructions.'}
+                      </span>
+                    </button>
+                    <button role="menuitem" className="download-option" onClick={() => requestDownload('shop')}>
+                      <strong>PDF for a print shop</strong>
+                      <span>
+                        Single pages at {paper === 'a4' ? 'A5' : 'half-letter'} size with bleed and crop marks, ready to
+                        print, trim and staple.
+                      </span>
+                    </button>
+                  </>
+                )}
+                <button
+                  role="menuitem"
+                  className="download-option"
+                  onClick={() => {
+                    setExportMenu(false)
+                    prepareShare()
+                  }}
+                >
+                  <strong>Share</strong>
+                  <span>A PDF to read on screen, for sending to people.</span>
                 </button>
-                <button role="menuitem" className="download-option" onClick={() => requestDownload('shop')}>
-                  <strong>For a print shop</strong>
+                <button
+                  role="menuitem"
+                  className="download-option"
+                  onClick={() => {
+                    setExportMenu(false)
+                    setChecking({ target: defaultTarget, pending: false })
+                  }}
+                >
+                  <strong>
+                    Check for problems{warnings > 0 && <span className="badge">{warnings}</span>}
+                  </strong>
                   <span>
-                    Single pages at {paper === 'a4' ? 'A5' : 'half-letter'} size with bleed and crop marks, ready to
-                    print, trim and staple.
+                    {warnings > 0
+                      ? `${warnings} to fix before ${paper === 'instagram' ? 'posting' : 'printing'}.`
+                      : issues.length > 0
+                        ? `${issues.length} small thing${issues.length === 1 ? '' : 's'} to look at.`
+                        : 'All clear right now.'}
                   </span>
                 </button>
               </div>
@@ -1198,24 +1331,8 @@ function App() {
                         : undefined
                     }
                   />
-                  <figcaption>
-                    <div className="caption-row">
-                      <span className="tab tab--small">{caption(surface.kind, surface.label, i)}</span>
-                      <PageActions
-                        kind={surface.kind}
-                        color={surface.color}
-                        canMoveUp={draft[i - 1]?.kind === 'spread'}
-                        canMoveDown={draft[i + 1]?.kind === 'spread'}
-                        canAdd={spreadCount < MAX_SPREADS}
-                        canRemove={spreadCount > 1}
-                        onMove={(by) => edit((d) => moveSpread(d, i, by))}
-                        onAddText={() => addTextTo(i)}
-                        onAddShape={(kind) => addShapeTo(i, kind)}
-                        onColor={(c) => edit((d) => setSurfaceColor(d, i, c))}
-                        onAddSpread={() => edit((d) => insertSpread(d, i + 1, photos, paper, zineStyle, circles))}
-                        onRemove={() => edit((d) => removeSpread(d, i))}
-                      />
-                    </div>
+                  {/* The selected item's tools float at the bottom of the screen while this page is in view. */}
+                  <div className="dock" data-keep-selection>
                     {(() => {
                       // The precise tools: for a multiple selection here, or the one item selected here.
                       const many = group?.surface === i ? group : null
@@ -1287,6 +1404,25 @@ function App() {
                         onRemove={() => edit((d) => removeText(d, i, textSelected.id))}
                       />
                     )}
+                  </div>
+                  <figcaption>
+                    <div className="caption-row">
+                      <span className="tab tab--small">{caption(surface.kind, surface.label, i)}</span>
+                      <PageActions
+                        kind={surface.kind}
+                        color={surface.color}
+                        canMoveUp={draft[i - 1]?.kind === 'spread'}
+                        canMoveDown={draft[i + 1]?.kind === 'spread'}
+                        canAdd={spreadCount < MAX_SPREADS}
+                        canRemove={spreadCount > 1}
+                        onMove={(by) => edit((d) => moveSpread(d, i, by))}
+                        onAddText={() => addTextTo(i)}
+                        onAddShape={(kind) => addShapeTo(i, kind)}
+                        onColor={(c) => edit((d) => setSurfaceColor(d, i, c))}
+                        onAddSpread={() => edit((d) => insertSpread(d, i + 1, photos, paper, zineStyle, circles))}
+                        onRemove={() => edit((d) => removeSpread(d, i))}
+                      />
+                    </div>
                     <LayoutPicker
                       zineStyle={zineStyle}
                       circles={circles}
@@ -1316,6 +1452,21 @@ function App() {
           </button>
         )}
       </main>
+
+      {viewing && (
+        <PhotoViewer
+          photos={photos}
+          places={places}
+          lookAlikes={similar}
+          startId={viewing}
+          onPlace={(id) => {
+            setGroup(null)
+            setSwapFrom(null)
+            setSelected({ type: 'photo', id })
+          }}
+          onClose={() => setViewing(null)}
+        />
+      )}
 
       {previewing && draft && (
         <Preview

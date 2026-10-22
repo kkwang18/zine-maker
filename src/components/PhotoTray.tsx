@@ -1,24 +1,19 @@
-import { surfaceLabel } from '../lib/draft'
-import type { Draft, Photo } from '../lib/types'
+import type { Photo } from '../lib/types'
 import { startDrag } from './dragItem'
 
 interface Props {
   photos: Photo[]
-  draft: Draft | null
+  places: Map<string, string>
   lookAlikes: Set<string>
   selectedId: string | null
   onSelect: (id: string) => void
+  /** Open the photo whole and uncropped. */
+  onView: (id: string) => void
   onRemove: (id: string) => void
 }
 
 /** The uploaded photos, marked with where each one ended up. Drag one onto a page to place it. */
-export function PhotoTray({ photos, draft, lookAlikes, selectedId, onSelect, onRemove }: Props) {
-  const where = new Map<string, string>()
-  draft?.forEach((surface, i) => {
-    for (const id of surface.photoIds) if (id) where.set(id, surfaceLabel(draft, i))
-    for (const f of surface.free ?? []) where.set(f.photoId, surfaceLabel(draft, i))
-  })
-
+export function PhotoTray({ photos, places: where, lookAlikes, selectedId, onSelect, onView, onRemove }: Props) {
   return (
     <ul className="tray">
       {photos.map((photo) => {
@@ -35,11 +30,15 @@ export function PhotoTray({ photos, draft, lookAlikes, selectedId, onSelect, onR
               draggable
               onDragStart={(e) => startDrag(e, { type: 'photo', id: photo.id })}
               onClick={() => onSelect(photo.id)}
+              onDoubleClick={() => onView(photo.id)}
               aria-pressed={selectedId === photo.id}
               aria-label={`${photo.name}, ${label}`}
             >
               <img src={photo.thumb} alt="" draggable={false} decoding="async" />
               <span className="tray__label">{label}</span>
+            </button>
+            <button className="tray__view" onClick={() => onView(photo.id)} aria-label={`View ${photo.name}`} title="View whole photo">
+              ⤢
             </button>
             <button className="tray__remove" onClick={() => onRemove(photo.id)} aria-label={`Remove ${photo.name}`}>
               ×

@@ -34,6 +34,16 @@ export function surfaceLabel(draft: Draft, i: number): string {
   return `${i * 2} – ${i * 2 + 1}`
 }
 
+/** Where each photo is in the zine ("Cover", "2 – 3", …); photos not on any page are left out. */
+export function placesOf(draft: Draft | null): Map<string, string> {
+  const where = new Map<string, string>()
+  draft?.forEach((surface, i) => {
+    for (const id of surface.photoIds) if (id) where.set(id, surfaceLabel(draft, i))
+    for (const f of surface.free ?? []) where.set(f.photoId, surfaceLabel(draft, i))
+  })
+  return where
+}
+
 /** The largest rect of physical aspect `aspect` that fits in `box`, centred. */
 function contain(box: Rect, aspect: number, surfaceAspect: number): Rect {
   const boxAspect = (box.w * surfaceAspect) / box.h
