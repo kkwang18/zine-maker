@@ -153,6 +153,15 @@ export interface FreeText {
 
 export type SurfaceKind = 'cover' | 'spread' | 'back'
 
+/** A photo placed anywhere on a page by hand, outside any layout slot. */
+export interface FreePhoto {
+  id: string
+  photoId: string
+  /** The photo keeps its shape inside this box. */
+  box: Rect
+  z: number
+}
+
 /** The editable zine: a layout and a photo per slot for each surface, in reading order. */
 export interface DraftSurface {
   kind: SurfaceKind
@@ -162,6 +171,8 @@ export interface DraftSurface {
   /** Hand arrangement, per slot (parallel to photoIds). */
   frames?: (Frame | null)[]
   texts?: FreeText[]
+  /** Photos placed anywhere by hand, on top of (or instead of) the layout. */
+  free?: FreePhoto[]
   /** Page colour for just this surface, instead of the zine's. */
   color?: PageColor
 }
@@ -190,5 +201,6 @@ export interface Surface {
   }[]
   text: TextBlock[]
   texts: FreeText[]
+  free: { id: string; placement: Placement; z: number }[]
   color?: PageColor
 }

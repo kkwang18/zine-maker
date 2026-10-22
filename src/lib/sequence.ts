@@ -324,7 +324,9 @@ function bestFor(pool: Pool, ref: SlotRef, candidates: number[], keep: Set<numbe
 }
 
 function usedIds(draft: Draft): Set<string> {
-  return new Set(draft.flatMap((s) => s.photoIds.filter((id): id is string => id !== null)))
+  return new Set(
+    draft.flatMap((s) => [...s.photoIds.filter((id): id is string => id !== null), ...(s.free ?? []).map((f) => f.photoId)]),
+  )
 }
 
 /**

@@ -1,4 +1,4 @@
-import { layoutName, layoutsFor } from '../lib/layouts'
+import { isBlank, layoutName, layoutsFor } from '../lib/layouts'
 import type { Slot, SurfaceKind, ZineStyle } from '../lib/types'
 
 interface Props {
@@ -50,6 +50,7 @@ export function LayoutPicker({ zineStyle, circles, kind, aspect, current, onPick
               )
             })}
             {kind === 'spread' && <span className="picker__fold" />}
+            {isBlank(t.id) && <span className="picker__plus">+</span>}
           </span>
         </button>
       ))}

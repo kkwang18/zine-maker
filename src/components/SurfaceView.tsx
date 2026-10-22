@@ -14,6 +14,7 @@ import { isZineDrag } from './dragItem'
 /** Hooks for arranging the page by hand; leave out to draw the surface as it will print. */
 export interface SurfaceEditor {
   selectedSlot: number | null
+  selectedFree: string | null
   selectedText: string | null
   editingText: string | null
   /** A photo is waiting to be swapped: other photos and empty slots light up as targets. */
@@ -22,12 +23,18 @@ export interface SurfaceEditor {
   /** A photo dragged in from the tray. */
   onSlotDrop: (slot: number, e: DragEvent) => void
   onFrameChange: (slot: number, box: Rect) => void
+  onFreeClick: (id: string) => void
+  /** A photo dragged in from the tray onto a freely placed photo. */
+  onFreeDrop: (id: string, e: DragEvent) => void
+  onFreeChange: (id: string, box: Rect) => void
+  /** A photo dragged in from the tray onto bare page, at `point` (surface fractions). */
+  onPageDrop: (point: { x: number; y: number }, e: DragEvent) => void
   onTextClick: (id: string) => void
   onTextEdit: (id: string) => void
   onTextChange: (id: string, change: Partial<FreeText>) => void
   onTextEditEnd: () => void
-  /** A press on the bare page, away from any photo or text. */
-  onBackground: () => void
+  /** A press on the bare page, away from any photo or text, at `point` (surface fractions). */
+  onBackground: (point: { x: number; y: number }) => void
 }
 
 interface Props {
@@ -40,6 +47,8 @@ interface Props {
   onWordsClick?: (kind: TextKind) => void
   /** What joins a spread's two pages: a paper fold, the edge between two slides, or nothing. */
   seam?: 'fold' | 'slides' | 'none'
+  /** Show centre lines, thirds and margins on each page, for lining things up. */
+  showGuides?: boolean
 }
 
 const pct = (v: number) => `${v * 100}%`
@@ -50,7 +59,7 @@ const TEXT_SIZE = { s: 3, m: 5, l: 9 }
 const TEXT_COLOR = { auto: 'var(--page-text)', black: '#0a0a0a', white: '#ffffff' }
 
 type Corner = 'nw' | 'ne' | 'sw' | 'se'
-type Item = { type: 'slot'; slot: number } | { type: 'text'; id: string }
+type Item = { type: 'slot'; slot: number } | { type: 'free'; id: string } | { type: 'text'; id: string }
 
 interface Gesture {
   item: Item
@@ -78,10 +87,35 @@ const MIN_SIZE = 0.04
 
 const sameGuides = (a: Guides, b: Guides) => a.x.join() === b.x.join() && a.y.join() === b.y.join()
 
-const itemKey = (item: Item) => (item.type === 'slot' ? `s${item.slot}` : `t${item.id}`)
+const itemKey = (item: Item) =>
+  item.type === 'slot' ? `s${item.slot}` : item.type === 'free' ? `f${item.id}` : `t${item.id}`
+
+/** Margin of the layout guides, as a share of the page. */
+const MARGIN = 0.06
+
+/**
+ * Layout guides for each page of a surface, in surface fractions: page edges
+ * and centres, thirds, and a margin. Photos snap to these too.
+ */
+function pageGuides(spread: boolean): Guides {
+  const pages = spread ? [0, 0.5] : [0]
+  const pw = spread ? 0.5 : 1
+  const x = pages.flatMap((p) => [p + pw * MARGIN, p + pw / 3, p + pw / 2, p + (pw * 2) / 3, p + pw * (1 - MARGIN)])
+  const y = [MARGIN, 1 / 3, 0.5, 2 / 3, 1 - MARGIN]
+  return { x, y }
+}
 
 /** One cover, spread, or back page, drawn at any size. */
-export function SurfaceView({ surface, zineStyle, photos, words, editor, onWordsClick, seam = 'fold' }: Props) {
+export function SurfaceView({
+  surface,
+  zineStyle,
+  photos,
+  words,
+  editor,
+  onWordsClick,
+  seam = 'fold',
+  showGuides = false,
+}: Props) {
   const root = useRef<HTMLDivElement>(null)
   const gesture = useRef<Gesture | null>(null)
   const [guides, setGuides] = useState<Guides>({ x: [], y: [] })
@@ -117,7 +151,7 @@ export function SurfaceView({ surface, zineStyle, photos, words, editor, onWords
       start,
       pointer: { x: e.clientX, y: e.clientY },
       size: { w: bounds.width, h: bounds.height },
-      targets: snapTargets(otherRects(item), surface.kind === 'spread'),
+      targets: withPageGuides(snapTargets(otherRects(item), surface.kind === 'spread'), surface.kind === 'spread'),
       moved: action !== 'move',
       el: root.current!.querySelector<HTMLElement>(`[data-item="${itemKey(item)}"]`)!,
     }
@@ -202,11 +236,19 @@ export function SurfaceView({ surface, zineStyle, photos, words, editor, onWords
     if (!g.moved || !result) {
       // A press without a drag is a click.
       if (g.item.type === 'slot') editor.onSlotClick(g.item.slot)
+      else if (g.item.type === 'free') editor.onFreeClick(g.item.id)
       else editor.onTextClick(g.item.id)
       return
     }
     if (g.item.type === 'slot') editor.onFrameChange(g.item.slot, result)
+    else if (g.item.type === 'free') editor.onFreeChange(g.item.id, result)
     else editor.onTextChange(g.item.id, { x: result.x, y: result.y, w: result.w })
+  }
+
+  /** Where on the surface a pointer or drop landed, in surface fractions. */
+  const pointOf = (e: { clientX: number; clientY: number }) => {
+    const r = root.current!.getBoundingClientRect()
+    return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }
   }
 
   return (
@@ -217,7 +259,17 @@ export function SurfaceView({ surface, zineStyle, photos, words, editor, onWords
       data-template={surface.templateId}
       onPointerDown={editor && ((e) => {
         const target = e.target as HTMLElement
-        if (target === e.currentTarget || target.classList.contains('surface__seam')) editor.onBackground()
+        if (target === e.currentTarget || target.classList.contains('surface__seam') || target.classList.contains('layout-guide'))
+          editor.onBackground(pointOf(e))
+      })}
+      // A photo from the tray dropped on bare page lands right there.
+      onDragOver={editor && ((e) => {
+        if (isZineDrag(e)) e.preventDefault()
+      })}
+      onDrop={editor && ((e) => {
+        if (!isZineDrag(e)) return
+        e.preventDefault()
+        editor.onPageDrop(pointOf(e), e)
       })}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -232,13 +284,37 @@ export function SurfaceView({ surface, zineStyle, photos, words, editor, onWords
         return (
           <PhotoItem
             key={i}
-            index={i}
+            itemKey={itemKey(item)}
             placement={placement}
             photo={photo}
             z={z}
             moved={moved}
-            editor={editor}
+            editable={Boolean(editor)}
+            selected={editor?.selectedSlot === i}
             onBegin={(e, action) => begin(e, item, action, placement.dest)}
+            onActivate={() => editor?.onSlotClick(i)}
+            onDropPhoto={(e) => editor?.onSlotDrop(i, e)}
+          />
+        )
+      })}
+
+      {surface.free.map(({ id, placement, z }) => {
+        const photo = photos.get(placement.photoId)
+        if (!photo) return null
+        const item: Item = { type: 'free', id }
+        return (
+          <PhotoItem
+            key={id}
+            itemKey={itemKey(item)}
+            placement={placement}
+            photo={photo}
+            z={z}
+            moved={false}
+            editable={Boolean(editor)}
+            selected={editor?.selectedFree === id}
+            onBegin={(e, action) => begin(e, item, action, placement.dest)}
+            onActivate={() => editor?.onFreeClick(id)}
+            onDropPhoto={(e) => editor?.onFreeDrop(id, e)}
           />
         )
       })}
@@ -260,6 +336,8 @@ export function SurfaceView({ surface, zineStyle, photos, words, editor, onWords
       })}
 
       {surface.kind === 'spread' && seam !== 'none' && <div className={`surface__seam surface__seam--${seam}`} />}
+
+      {showGuides && editor && <LayoutGuides spread={surface.kind === 'spread'} />}
 
       {guides.x.map((x) => (
         <div key={`x${x}`} className="guide guide--v edit-ui" style={{ left: pct(x) }} />
@@ -313,21 +391,29 @@ function EmptySlot({ index, rect, editor }: { index: number; rect: Rect; editor:
  * `src` shows exactly the kept part of the photo — the file itself is untouched.
  */
 function PhotoItem({
-  index,
+  itemKey,
   placement,
   photo,
   z,
   moved,
-  editor,
+  editable,
+  selected,
   onBegin,
+  onActivate,
+  onDropPhoto,
 }: {
-  index: number
+  itemKey: string
   placement: Placement
   photo: Photo
   z: number
   moved: boolean
-  editor?: SurfaceEditor
+  editable: boolean
+  selected: boolean
   onBegin: (e: ReactPointerEvent, action: 'move' | Corner) => void
+  /** Keyboard Enter or Space: the same as clicking it. */
+  onActivate: () => void
+  /** A photo from the tray dropped on this one. */
+  onDropPhoto: (e: DragEvent) => void
 }) {
   const [over, setOver] = useState(false)
   const { dest, src } = placement
@@ -337,7 +423,7 @@ function PhotoItem({
     left: pct(-src.x / src.w),
     top: pct(-src.y / src.h),
   }
-  const selected = editor?.selectedSlot === index
+  const editor = editable || undefined
   const classes = [
     'item',
     editor && 'item--editable',
@@ -349,7 +435,7 @@ function PhotoItem({
     <div
       className={classes.filter(Boolean).join(' ')}
       style={{ ...box(dest), zIndex: z + 1 }}
-      data-item={`s${index}`}
+      data-item={itemKey}
       data-keep-selection
       role={editor ? 'button' : undefined}
       tabIndex={editor ? 0 : undefined}
@@ -360,7 +446,7 @@ function PhotoItem({
         ((e) => {
           if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault()
-            editor.onSlotClick(index)
+            onActivate()
           }
         })
       }
@@ -377,10 +463,11 @@ function PhotoItem({
         editor &&
         ((e) => {
           setOver(false)
-          if (!isZineDrag(e)) return
+          // With Shift held, let the drop fall through to the page: the new photo goes on top instead.
+          if (!isZineDrag(e) || e.shiftKey) return
           e.preventDefault()
           e.stopPropagation()
-          editor.onSlotDrop(index, e)
+          onDropPhoto(e)
         })
       }
     >
@@ -511,5 +598,35 @@ function Text({
     >
       {content}
     </div>
+  )
+}
+
+/** Snap lines from the layout guides, added to everything else's edges. */
+function withPageGuides(targets: Guides, spread: boolean): Guides {
+  const page = pageGuides(spread)
+  return { x: [...targets.x, ...page.x], y: [...targets.y, ...page.y] }
+}
+
+/** Faint lines to line things up by: each page's centre, thirds and margin. */
+function LayoutGuides({ spread }: { spread: boolean }) {
+  const { x, y } = pageGuides(spread)
+  const centres = new Set([...(spread ? [0.25, 0.75] : [0.5]), 0.5])
+  return (
+    <>
+      {x.map((v) => (
+        <div
+          key={`gx${v}`}
+          className={`layout-guide layout-guide--v edit-ui${centres.has(v) ? ' layout-guide--centre' : ''}`}
+          style={{ left: pct(v) }}
+        />
+      ))}
+      {y.map((v) => (
+        <div
+          key={`gy${v}`}
+          className={`layout-guide layout-guide--h edit-ui${v === 0.5 ? ' layout-guide--centre' : ''}`}
+          style={{ top: pct(v) }}
+        />
+      ))}
+    </>
   )
 }

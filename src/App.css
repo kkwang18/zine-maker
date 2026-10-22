@@ -688,7 +688,10 @@
 }
 
 /* Quiet: small, spaced, bookish. */
-.text--title {
+/* Title, name and back text all share the font picked for the zine. */
+.text--title,
+.text--byline,
+.text--colophon {
   font-family: var(--title-font);
 }
 
@@ -699,7 +702,6 @@
 
 .look--quiet .text--byline,
 .look--quiet .text--colophon {
-  font-family: var(--mono);
   letter-spacing: 0.12em;
   text-transform: uppercase;
 }
@@ -724,7 +726,6 @@
 }
 
 .look--magazine .text--byline {
-  font-family: var(--sans);
   font-size: calc(var(--u) * 3.4);
   font-weight: 500;
 }
@@ -734,7 +735,6 @@
   padding: calc(var(--u) * 2) calc(var(--u) * 3);
   border: 1px solid currentColor;
   border-radius: calc(var(--u) * 2.4);
-  font-family: var(--sans);
   font-size: calc(var(--u) * 3);
   line-height: 1.5;
 }
@@ -748,7 +748,6 @@
 }
 
 .look--collage .text--byline {
-  font-family: var(--sans);
   font-size: calc(var(--u) * 2.8);
   font-weight: 500;
   letter-spacing: 0.14em;
@@ -757,7 +756,6 @@
 
 .look--collage .text--colophon {
   max-width: 88%;
-  font-family: var(--sans);
   font-size: calc(var(--u) * 3);
   line-height: 1.5;
 }
@@ -828,6 +826,30 @@
 
 .guide--v { top: 0; bottom: 0; width: 1px; }
 .guide--h { left: 0; right: 0; height: 1px; }
+
+/* Layout guides: centre lines, thirds and margins, for lining things up by eye. */
+.layout-guide {
+  position: absolute;
+  z-index: 900;
+  pointer-events: none;
+}
+
+.layout-guide--v {
+  top: 0;
+  bottom: 0;
+  border-left: 1px dashed rgb(47 140 255 / 0.55);
+}
+
+.layout-guide--h {
+  left: 0;
+  right: 0;
+  border-top: 1px dashed rgb(47 140 255 / 0.55);
+}
+
+.layout-guide--centre {
+  border-style: solid;
+  border-color: rgb(47 140 255 / 0.8);
+}
 
 /* Text boxes added to a page. */
 .free-text {
@@ -1067,6 +1089,16 @@
   border-radius: 50%;
 }
 
+.picker__plus {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 15px;
+  font-weight: 500;
+  line-height: 1;
+}
+
 .picker__fold {
   position: absolute;
   left: 50%;
@@ -1097,6 +1129,28 @@
 
 .stage__spacer {
   flex: 1;
+}
+
+/* Pops out under the top bar once the shareable PDF is ready. */
+.share-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(380px, 92vw);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  background: var(--card);
+  border: 1px solid var(--ink);
+  border-radius: 18px;
+  box-shadow: 6px 6px 0 rgb(10 10 10 / 0.12);
+}
+
+.share-panel p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 /* ── Preview ────────────────────────────────────────────────── */

@@ -9,9 +9,10 @@ import { Preview } from './components/Preview'
 import { SurfaceView, type SurfaceEditor } from './components/SurfaceView'
 import { forget, loadPhoto, showable, stored } from './lib/analyze'
 import {
+  addFree,
   addText,
-  clearSlot,
   moveFrame,
+  moveFree,
   moveSpread,
   placePhoto,
   removePhoto as withoutPhoto,
@@ -21,11 +22,14 @@ import {
   resetFrame,
   restack,
   setSurfaceColor,
-  swapSlots,
+  swapPhotos,
+  takeOff,
   updateText,
+  type PhotoRef,
 } from './lib/draft'
+import { carouselPosts } from './lib/carousel'
 import { clearSaved, deletePhoto, loadSaved, savePhotos, saveState } from './lib/persist'
-import { PAPER } from './lib/geometry'
+import { PAPER, pageAspect } from './lib/geometry'
 import { findLayout, hasCircles, withoutCircles } from './lib/layouts'
 import { fillEmptySlots, insertSpread, lookAlikes, MIN_PHOTOS, relayout, sequence } from './lib/sequence'
 import { NEW_DOC, type Doc } from './lib/doc'
@@ -36,12 +40,16 @@ import './App.css'
 
 const THIS_MONTH = new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
 
-/** Instagram carousels hold up to 20 slides: a cover, a back, and nine spreads. */
-const MAX_SPREADS = 9
+/**
+ * Up to 64 pages: about the most a stapled booklet folds well. On Instagram,
+ * longer zines are split into several carousel posts.
+ */
+const MAX_SPREADS = 31
 
 /** What's selected: a photo or empty slot on a page, a photo in the tray, or a text box. */
 type Selection =
   | { type: 'slot'; at: SlotAddress }
+  | { type: 'free'; surface: number; id: string }
   | { type: 'photo'; id: string }
   | { type: 'text'; surface: number; id: string }
 
@@ -50,6 +58,9 @@ function isTyping(): boolean {
   const el = document.activeElement as HTMLElement | null
   return Boolean(el && (el.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName)))
 }
+
+/** Wait for the next frame to be drawn, or a moment if the tab isn't drawing (it's in the background). */
+const nextFrame = () => Promise.race([new Promise(requestAnimationFrame), new Promise((done) => setTimeout(done, 100))])
 
 /** Save a file to the person's computer. */
 function download(blob: Blob, name: string) {
@@ -83,12 +94,17 @@ function App() {
   const setManual = (next: Draft | null) => change({ manual: next })
   const [selected, setSelected] = useState<Selection | null>(null)
   // Waiting for a second photo or slot to swap with.
-  const [swapFrom, setSwapFrom] = useState<SlotAddress | null>(null)
+  const [swapFrom, setSwapFrom] = useState<PhotoRef | null>(null)
   const [editingText, setEditingText] = useState<string | null>(null)
   const [dragging, setDragging] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [exportError, setExportError] = useState('')
   const [previewing, setPreviewing] = useState(false)
+  const [showGuides, setShowGuides] = useState(false)
+  // The digital edition, once made; cleared whenever the zine changes so it's never stale.
+  const [shareFile, setShareFile] = useState<File | null>(null)
+  const [sharing, setSharing] = useState(false)
+  const [shareNote, setShareNote] = useState('')
   // Autosave: nothing is written until the last session has been read back in.
   const [ready, setReady] = useState(false)
   const [saveNote, setSaveNote] = useState('')
@@ -147,23 +163,41 @@ function App() {
     setSwapFrom(null)
   }
 
-  const sameSlot = (a: SlotAddress, b: SlotAddress) => a.surface === b.surface && a.slot === b.slot
+  /** The photo spot a selection points at, if it's a photo on a page. */
+  const refOf = (sel: Selection | null): PhotoRef | null =>
+    sel?.type === 'slot' || sel?.type === 'free' ? sel : null
+  const sameRef = (a: PhotoRef, b: PhotoRef) =>
+    a.type === 'slot' && b.type === 'slot'
+      ? a.at.surface === b.at.surface && a.at.slot === b.at.slot
+      : a.type === 'free' && b.type === 'free' && a.id === b.id
 
   // Clicking a photo or slot on a page: finish a swap, drop in a tray photo, or select it.
-  const clickSlot = (at: SlotAddress) => {
+  const clickRef = (ref: PhotoRef) => {
+    const current = refOf(selected)
     if (swapFrom) {
-      if (sameSlot(swapFrom, at)) setSwapFrom(null)
-      else edit((d) => swapSlots(d, swapFrom, at), { type: 'slot', at })
+      if (sameRef(swapFrom, ref)) setSwapFrom(null)
+      else edit((d) => swapPhotos(d, swapFrom, ref), ref)
     } else if (selected?.type === 'photo') {
-      edit((d) => placePhoto(d, selected.id, at), { type: 'slot', at })
+      edit((d) => placePhoto(d, selected.id, ref), ref)
     } else {
-      setSelected(selected?.type === 'slot' && sameSlot(selected.at, at) ? null : { type: 'slot', at })
+      setSelected(current && sameRef(current, ref) ? null : ref)
     }
   }
 
   const clickTrayPhoto = (id: string) => {
-    if (selected?.type === 'slot') edit((d) => placePhoto(d, id, selected.at), selected)
+    const at = refOf(selected)
+    if (at) edit((d) => placePhoto(d, id, at), at)
     else setSelected(selected?.type === 'photo' && selected.id === id ? null : { type: 'photo', id })
+  }
+
+  /** Put a photo anywhere on a page, centred where it was dropped or clicked. */
+  const placeFreely = (surface: number, photoId: string, point: { x: number; y: number }) => {
+    const photo = byId.get(photoId)
+    if (!draft || !photo) return
+    const { draft: next, id } = addFree(draft, surface, photo, point, surfaces[surface].aspect)
+    setManual(next)
+    setSelected({ type: 'free', surface, id })
+    setSwapFrom(null)
   }
 
   // Typing into a text box only lasts while it stays selected.
@@ -171,16 +205,29 @@ function App() {
 
   const editorFor = (surface: number): SurfaceEditor => ({
     selectedSlot: selected?.type === 'slot' && selected.at.surface === surface ? selected.at.slot : null,
+    selectedFree: selected?.type === 'free' && selected.surface === surface ? selected.id : null,
     selectedText: selected?.type === 'text' && selected.surface === surface ? selected.id : null,
     editingText: typingIn,
     swapping: swapFrom !== null,
-    onSlotClick: (slot) => clickSlot({ surface, slot }),
+    onSlotClick: (slot) => clickRef({ type: 'slot', at: { surface, slot } }),
     onSlotDrop: (slot, e) => {
       const item = readDrag(e)
-      if (item) edit((d) => placePhoto(d, item.id, { surface, slot }), { type: 'slot', at: { surface, slot } })
+      const at: PhotoRef = { type: 'slot', at: { surface, slot } }
+      if (item) edit((d) => placePhoto(d, item.id, at), at)
     },
     onFrameChange: (slot, box) =>
       edit((d) => moveFrame(d, { surface, slot }, box), { type: 'slot', at: { surface, slot } }),
+    onFreeClick: (id) => clickRef({ type: 'free', surface, id }),
+    onFreeDrop: (id, e) => {
+      const item = readDrag(e)
+      const at: PhotoRef = { type: 'free', surface, id }
+      if (item) edit((d) => placePhoto(d, item.id, at), at)
+    },
+    onFreeChange: (id, box) => edit((d) => moveFree(d, surface, id, box), { type: 'free', surface, id }),
+    onPageDrop: (point, e) => {
+      const item = readDrag(e)
+      if (item) placeFreely(surface, item.id, point)
+    },
     onTextClick: (id) => {
       setSwapFrom(null)
       setSelected({ type: 'text', surface, id })
@@ -191,7 +238,11 @@ function App() {
     },
     onTextChange: (id, change) => edit((d) => updateText(d, surface, id, change), { type: 'text', surface, id }),
     onTextEditEnd: () => setEditingText(null),
-    onBackground: deselect,
+    // With a photo picked in the tray, clicking bare page puts it there; otherwise it deselects.
+    onBackground: (point) => {
+      if (selected?.type === 'photo') placeFreely(surface, selected.id, point)
+      else deselect()
+    },
   })
 
   const addTextTo = (surface: number) => {
@@ -252,6 +303,48 @@ function App() {
 
   const fileName = title.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'zine'
 
+  // A shared file must match the zine as it is now.
+  useEffect(() => {
+    setShareFile(null)
+    setShareNote('')
+  }, [history.present, photos])
+
+  /**
+   * Make the digital edition: a PDF for reading on screen, one page per spread.
+   * Browsers only open the share menu straight after a click, and this takes a
+   * moment, so sending is a second step (see `sendShareFile`).
+   */
+  const prepareShare = async () => {
+    if (!book.current) return
+    deselect()
+    setSharing(true)
+    setShareNote('')
+    try {
+      await nextFrame()
+      const { renderDigitalPdf } = await import('./lib/exportDigital')
+      const pdf = await renderDigitalPdf(book.current, pageAspect(paper), title.trim())
+      setShareFile(new File([pdf], `${fileName}.pdf`, { type: 'application/pdf' }))
+    } catch (err) {
+      setShareNote(`Couldn’t make the PDF: ${err instanceof Error ? err.message : err}`)
+    } finally {
+      setSharing(false)
+    }
+  }
+
+  const canShareFiles = (file: File) => typeof navigator.canShare === 'function' && navigator.canShare({ files: [file] })
+
+  const sendShareFile = async () => {
+    if (!shareFile) return
+    try {
+      await navigator.share({ files: [shareFile], title: title.trim() || 'My zine' })
+      setShareNote('Sent.')
+    } catch (err) {
+      // Closing the share menu without picking anything isn't an error.
+      if (err instanceof DOMException && err.name === 'AbortError') return
+      setShareNote('Sharing didn’t work here. Download the PDF and attach it instead.')
+    }
+  }
+
   /** The print PDF, or Instagram slides, depending on the format. */
   const downloadZine = async () => {
     if (!book.current) return
@@ -260,11 +353,12 @@ function App() {
     setExportError('')
     try {
       // Let the cleared selection render first, so no outline ends up in the pictures.
-      await new Promise(requestAnimationFrame)
+      await nextFrame()
       // The exporters are only loaded when first used, to keep the app quick to open.
       if (paper === 'instagram') {
         const { renderSlides, zipSlides } = await import('./lib/exportSlides')
-        download(await zipSlides(await renderSlides(book.current)), `${fileName}-instagram.zip`)
+        const perSurface = surfaces.map((s) => (s.kind === 'spread' ? 2 : 1))
+        download(await zipSlides(await renderSlides(book.current), perSurface), `${fileName}-instagram.zip`)
       } else {
         const { renderPrintPdf } = await import('./lib/exportPdf')
         download(await renderPrintPdf(book.current, paper, title.trim()), `${fileName}-print.pdf`)
@@ -339,8 +433,11 @@ function App() {
 
   // How long the zine is, and what that means for printing or posting.
   const pageCount = spreadCount * 2 + 2
+  const posts = carouselPosts(draft?.map((s) => (s.kind === 'spread' ? 2 : 1)) ?? []).map((p) => p.length)
   const lengthNote = !PAPER[paper].print
-    ? `${pageCount} slides at 1080 × 1350 for a carousel post. Each spread runs across two slides, so it pans as you swipe.`
+    ? posts.length > 1
+      ? `${pageCount} slides at 1080 × 1350: more than Instagram's 20 per post, so the download is split into ${posts.length} posts (${posts.join(' + ')} slides). Spreads stay whole.`
+      : `${pageCount} slides at 1080 × 1350 for a carousel post. Each spread runs across two slides, so it pans as you swipe.`
     : spreadCount === 3
       ? '8 pages, folded from one sheet.'
       : `${pageCount} pages, a stapled booklet${pageCount % 4 ? ' (printing adds a blank page to make a multiple of 4)' : ''}.`
@@ -391,9 +488,7 @@ function App() {
       if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault()
         setManual(
-          selected.type === 'slot'
-            ? clearSlot(draft, selected.at)
-            : removeText(draft, selected.surface, selected.id),
+          selected.type === 'text' ? removeText(draft, selected.surface, selected.id) : takeOff(draft, selected),
         )
         setSelected(null)
         return
@@ -407,6 +502,9 @@ function App() {
         const t = draft[selected.surface].texts?.find((x) => x.id === selected.id)
         // A run of nudges is one undo step.
         if (t) change({ manual: updateText(draft, selected.surface, t.id, { x: t.x + dx, y: t.y + dy }) }, 'nudge')
+      } else if (selected.type === 'free') {
+        const dest = renderDraft(draft, byId, paper)[selected.surface].free.find((f) => f.id === selected.id)?.placement.dest
+        if (dest) change({ manual: moveFree(draft, selected.surface, selected.id, { ...dest, x: dest.x + dx, y: dest.y + dy }) }, 'nudge')
       } else {
         const dest = renderDraft(draft, byId, paper)[selected.at.surface].slots[selected.at.slot].placement?.dest
         if (dest) change({ manual: moveFrame(draft, selected.at, { ...dest, x: dest.x + dx, y: dest.y + dy }) }, 'nudge')
@@ -568,8 +666,8 @@ function App() {
             />
           </label>
           <div className="field">
-            <span>Title font</span>
-            <div className="fonts" role="radiogroup" aria-label="Title font">
+            <span>Font</span>
+            <div className="fonts" role="radiogroup" aria-label="Font for the title, name and back text">
               {(Object.keys(TITLE_FONTS) as TitleFont[]).map((f) => (
                 <button
                   key={f}
@@ -639,10 +737,10 @@ function App() {
             <p className="hint">
               ☞{' '}
               {selected?.type === 'photo'
-                ? 'Now click a photo or empty slot on a page to put it there.'
-                : selected?.type === 'slot'
+                ? 'Now click a photo or slot to put it there, or anywhere on a page to place it freely.'
+                : selected?.type === 'slot' || selected?.type === 'free'
                   ? 'Click a photo below to put it in the selected spot.'
-                  : 'Drag a photo onto a page to place it. Click a photo on a page to move, resize or swap it.'}
+                  : 'Drag a photo onto a slot, or onto bare page to place it freely (hold Shift to drop it on top of another photo). Pick the + layout to start from blank.'}
             </p>
           )}
 
@@ -671,14 +769,54 @@ function App() {
             <button className="pill pill--small" disabled={!history.canRedo} onClick={redo} title="Redo (⇧⌘Z)">
               ↷ Redo
             </button>
+            <button
+              className="pill pill--small"
+              aria-pressed={showGuides}
+              onClick={() => setShowGuides(!showGuides)}
+              title="Centre lines, thirds and margins on every page"
+            >
+              Guides
+            </button>
             <span className="stage__spacer" />
             {exportError && <span className="hint hint--warn">☞ Couldn’t export: {exportError}</span>}
             <button className="pill" onClick={() => setPreviewing(true)}>
               Preview
             </button>
+            <button className="pill" disabled={sharing} onClick={prepareShare} title="A PDF to read on screen, for sending to people">
+              {sharing ? 'Preparing…' : 'Share'}
+            </button>
             <button className="pill pill--solid" disabled={exporting} onClick={downloadZine}>
               {exporting ? 'Making…' : paper === 'instagram' ? 'Download slides' : 'Download PDF'}
             </button>
+            {(shareFile || shareNote) && (
+              <div className="share-panel" role="status">
+                {shareFile ? (
+                  <>
+                    <p>
+                      <strong>Ready to share.</strong> {shareFile.name}, {(shareFile.size / 1e6).toFixed(1)} MB: one page
+                      per spread, opens on any phone or computer.
+                    </p>
+                    <div className="pills">
+                      {canShareFiles(shareFile) && (
+                        <button className="pill pill--solid" onClick={sendShareFile}>
+                          Send…
+                        </button>
+                      )}
+                      <button className="pill" onClick={() => download(shareFile, shareFile.name)}>
+                        Download
+                      </button>
+                      <button className="pill" onClick={() => setShareFile(null)}>
+                        Close
+                      </button>
+                    </div>
+                    {!canShareFiles(shareFile) && (
+                      <p className="hint">☞ This browser can’t open the share menu. Download it, then attach it to a message or email.</p>
+                    )}
+                  </>
+                ) : null}
+                {shareNote && <p className="hint">☞ {shareNote}</p>}
+              </div>
+            )}
           </div>
         )}
         {draft ? (
@@ -686,6 +824,13 @@ function App() {
             {surfaces.map((surface, i) => {
               const slotSelected = selected?.type === 'slot' && selected.at.surface === i ? selected.at : null
               const slot = slotSelected ? surface.slots[slotSelected.slot] : null
+              const freeSelected = selected?.type === 'free' && selected.surface === i ? selected : null
+              const photoSelected: PhotoRef | null = slot?.placement ? { type: 'slot', at: slotSelected! } : freeSelected
+              const layer = slotSelected
+                ? ({ type: 'slot', slot: slotSelected.slot } as const)
+                : freeSelected
+                  ? ({ type: 'free', id: freeSelected.id } as const)
+                  : null
               const textSelected = selected?.type === 'text' && selected.surface === i ? selectedText : undefined
               return (
                 // Keyed by position: spreads keep their place in the list as they're reordered.
@@ -698,6 +843,7 @@ function App() {
                     editor={editorFor(i)}
                     onWordsClick={editText}
                     seam={PAPER[paper].print ? 'fold' : 'slides'}
+                    showGuides={showGuides}
                   />
                   <figcaption>
                     <div className="caption-row">
@@ -716,15 +862,15 @@ function App() {
                         onRemove={() => edit((d) => removeSpread(d, i))}
                       />
                     </div>
-                    {slotSelected && slot?.placement && (
+                    {photoSelected && layer && (
                       <PhotoToolbar
-                        moved={slot.moved}
+                        moved={Boolean(slot?.moved)}
                         swapping={swapFrom !== null}
-                        onSwap={() => setSwapFrom(slotSelected)}
-                        onFront={() => edit((d) => restack(d, i, { type: 'slot', slot: slotSelected.slot }, 'front'), selected)}
-                        onBack={() => edit((d) => restack(d, i, { type: 'slot', slot: slotSelected.slot }, 'back'), selected)}
-                        onReset={() => edit((d) => resetFrame(d, slotSelected), selected)}
-                        onRemove={() => edit((d) => clearSlot(d, slotSelected))}
+                        onSwap={() => setSwapFrom(photoSelected)}
+                        onFront={() => edit((d) => restack(d, i, layer, 'front'), selected)}
+                        onBack={() => edit((d) => restack(d, i, layer, 'back'), selected)}
+                        onReset={() => slotSelected && edit((d) => resetFrame(d, slotSelected), selected)}
+                        onRemove={() => edit((d) => takeOff(d, photoSelected))}
                       />
                     )}
                     {textSelected && (

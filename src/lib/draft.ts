@@ -2,10 +2,13 @@ import { arrange } from './arrange'
 import { fitPhoto } from './fit'
 import { surfaceAspect } from './geometry'
 import { findLayout } from './layouts'
-import type { Draft, DraftSurface, FreeText, PageColor, PaperSize, Photo, Rect, SlotAddress, Surface } from './types'
+import type { Draft, DraftSurface, FreePhoto, FreeText, PageColor, PaperSize, Photo, Rect, SlotAddress, Surface } from './types'
 
 /** Text boxes start above the photos. */
 const TEXT_Z = 100
+/** Photos placed by hand start above the layout's photos, below text. */
+const FREE_Z = 50
+const FULL = { x: 0, y: 0, w: 1, h: 1 }
 
 /** "Cover", "2 – 3", …, "Back": pages in reading order, however many spreads there are. */
 export function surfaceLabel(draft: Draft, i: number): string {
@@ -44,6 +47,11 @@ export function renderDraft(draft: Draft, photos: Map<string, Photo>, paper: Pap
       text: template.text,
       texts: s.texts ?? [],
       color: s.color,
+      free: (s.free ?? []).flatMap((f) => {
+        const photo = photos.get(f.photoId)
+        if (!photo) return []
+        return [{ id: f.id, z: f.z, placement: { photoId: photo.id, dest: contain(f.box, photo.aspect, aspect), src: FULL } }]
+      }),
       slots: template.slots.map((slot, j) => {
         const frame = s.frames?.[j]
         const z = frame?.z ?? j
@@ -54,9 +62,8 @@ export function renderDraft(draft: Draft, photos: Map<string, Photo>, paper: Pap
         if (!photo) return { rect: frame?.box ?? home, placement: null, z, moved }
         if (fitted) {
           // The frame already has the photo's shape: the whole photo, uncropped.
-          const full = { x: 0, y: 0, w: 1, h: 1 }
           const dest = frame?.box ? contain(frame.box, photo.aspect, aspect) : home
-          return { rect: home, placement: { photoId: photo.id, dest, src: full, shape: slot.shape }, z, moved }
+          return { rect: home, placement: { photoId: photo.id, dest, src: FULL, shape: slot.shape }, z, moved }
         }
         // A photo placed by hand in a fill slot it can't fill with a small crop
         // is framed inside the slot instead — never cropped further.
@@ -92,28 +99,104 @@ function withSlot(draft: Draft, at: SlotAddress, photoId: string | null): Draft 
   }))
 }
 
-export function swapSlots(draft: Draft, a: SlotAddress, b: SlotAddress): Draft {
-  const pa = photoAt(draft, a)
-  const pb = photoAt(draft, b)
-  return withSlot(withSlot(draft, a, pb), b, pa)
+/** A photo on a page: in a layout slot, or placed freely by hand. */
+export type PhotoRef = { type: 'slot'; at: SlotAddress } | { type: 'free'; surface: number; id: string }
+
+function photoOf(draft: Draft, ref: PhotoRef): string | null {
+  if (ref.type === 'slot') return photoAt(draft, ref.at)
+  return draft[ref.surface]?.free?.find((f) => f.id === ref.id)?.photoId ?? null
+}
+
+/** Put a photo in a slot or free spot; null empties a slot, or removes a free spot. */
+function setPhoto(draft: Draft, ref: PhotoRef, photoId: string | null): Draft {
+  if (ref.type === 'slot') return withSlot(draft, ref.at, photoId)
+  return updateSurface(draft, ref.surface, (s) => ({
+    ...s,
+    free: photoId
+      ? (s.free ?? []).map((f) => (f.id === ref.id ? { ...f, photoId } : f))
+      : (s.free ?? []).filter((f) => f.id !== ref.id),
+  }))
+}
+
+/** Where a photo is on the pages, if anywhere. */
+export function findPhoto(draft: Draft, photoId: string): PhotoRef | null {
+  const at = locate(draft, photoId)
+  if (at) return { type: 'slot', at }
+  for (let surface = 0; surface < draft.length; surface++) {
+    const free = draft[surface].free?.find((f) => f.photoId === photoId)
+    if (free) return { type: 'free', surface, id: free.id }
+  }
+  return null
+}
+
+/** Swap the photos in two places. A free spot left without a photo goes away. */
+export function swapPhotos(draft: Draft, a: PhotoRef, b: PhotoRef): Draft {
+  const pa = photoOf(draft, a)
+  const pb = photoOf(draft, b)
+  return setPhoto(setPhoto(draft, a, pb), b, pa)
 }
 
 /**
- * Put a photo into a slot. If it was already placed somewhere, the two swap;
- * otherwise whatever was in the slot goes back to the unused pile.
+ * Put a photo somewhere. If it was already placed, the two swap; otherwise
+ * whatever was there goes back to the unused pile.
  */
-export function placePhoto(draft: Draft, photoId: string, at: SlotAddress): Draft {
-  const from = locate(draft, photoId)
-  return from ? swapSlots(draft, from, at) : withSlot(draft, at, photoId)
+export function placePhoto(draft: Draft, photoId: string, at: PhotoRef): Draft {
+  const from = findPhoto(draft, photoId)
+  return from ? swapPhotos(draft, from, at) : setPhoto(draft, at, photoId)
+}
+
+/** Take a photo off its page, wherever it is. */
+export function takeOff(draft: Draft, ref: PhotoRef): Draft {
+  return setPhoto(draft, ref, null)
 }
 
 export function clearSlot(draft: Draft, at: SlotAddress): Draft {
   return withSlot(draft, at, null)
 }
 
+/** A photo deleted from the zine: gone from every page. */
 export function removePhoto(draft: Draft, photoId: string): Draft {
-  const at = locate(draft, photoId)
-  return at ? clearSlot(draft, at) : draft
+  let next = draft
+  for (let ref = findPhoto(next, photoId); ref; ref = findPhoto(next, photoId)) next = setPhoto(next, ref, null)
+  return next
+}
+
+/**
+ * Place a photo freely on a page, centred on `point` (surface fractions), at a
+ * comfortable size. A photo already on a page moves here rather than appearing twice.
+ */
+export function addFree(
+  draft: Draft,
+  surface: number,
+  photo: Photo,
+  point: { x: number; y: number },
+  surfaceAspect: number,
+): { draft: Draft; id: string } {
+  const from = findPhoto(draft, photo.id)
+  let next = from ? setPhoto(draft, from, null) : draft
+  // About half a page wide, or less if that would make it too tall.
+  const pageWidth = draft[surface].kind === 'spread' ? 0.5 : 1
+  let w = pageWidth * 0.55
+  let h = (w * surfaceAspect) / photo.aspect
+  if (h > 0.7) {
+    h = 0.7
+    w = (h * photo.aspect) / surfaceAspect
+  }
+  const free: FreePhoto = {
+    id: crypto.randomUUID(),
+    photoId: photo.id,
+    box: { x: point.x - w / 2, y: point.y - h / 2, w, h },
+    z: Math.max(FREE_Z, ...stack(next[surface])) + 1,
+  }
+  next = updateSurface(next, surface, (s) => ({ ...s, free: [...(s.free ?? []), free] }))
+  return { draft: next, id: free.id }
+}
+
+export function moveFree(draft: Draft, surface: number, id: string, box: Rect): Draft {
+  return updateSurface(draft, surface, (s) => ({
+    ...s,
+    free: (s.free ?? []).map((f) => (f.id === id ? { ...f, box } : f)),
+  }))
 }
 
 // ── Arranging by hand ───────────────────────────────────────────────────────
@@ -137,16 +220,25 @@ export function resetFrame(draft: Draft, at: SlotAddress): Draft {
 
 /** Every stacking position in use on a surface: photos and text boxes. */
 function stack(s: DraftSurface): number[] {
-  return [...s.photoIds.map((_, j) => s.frames?.[j]?.z ?? j), ...(s.texts ?? []).map((t) => t.z)]
+  return [
+    ...s.photoIds.map((_, j) => s.frames?.[j]?.z ?? j),
+    ...(s.free ?? []).map((f) => f.z),
+    ...(s.texts ?? []).map((t) => t.z),
+  ]
 }
 
-export type Layer = { type: 'slot'; slot: number } | { type: 'text'; id: string }
+export type Layer = { type: 'slot'; slot: number } | { type: 'free'; id: string } | { type: 'text'; id: string }
 
 /** Bring something to the front of its page, or send it to the back. */
 export function restack(draft: Draft, surface: number, item: Layer, direction: 'front' | 'back'): Draft {
   const zs = stack(draft[surface])
   const z = direction === 'front' ? Math.max(...zs) + 1 : Math.min(...zs) - 1
   if (item.type === 'slot') return withFrame(draft, { surface, slot: item.slot }, (f) => ({ ...f, z }))
+  if (item.type === 'free')
+    return updateSurface(draft, surface, (s) => ({
+      ...s,
+      free: (s.free ?? []).map((f) => (f.id === item.id ? { ...f, z } : f)),
+    }))
   return updateText(draft, surface, item.id, { z })
 }
 

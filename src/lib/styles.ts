@@ -7,7 +7,8 @@ export const STYLES: Record<ZineStyle, { label: string; note: string; page: Page
 }
 
 /**
- * Fonts for the cover title. `width` is the average letter width in ems, so a
+ * Fonts for the zine's own words: the title, the name and the back text all
+ * use the one picked. `width` is the average letter width in ems, so a
  * masthead can size itself to fit the cover whatever the font.
  */
 export const TITLE_FONTS: Record<TitleFont, { label: string; family: string; width: number }> = {

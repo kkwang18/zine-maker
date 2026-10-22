@@ -7,43 +7,53 @@ function isPrintable(node: HTMLElement): boolean {
   return !EDITING_ONLY.some((c) => node.classList?.contains(c))
 }
 
+type Size = { width: number; height: number }
+
 /**
  * Draw every page of the zine, as laid out on screen, at `size` pixels each,
  * in reading order: cover, then each spread's left and right pages, then back.
  * A spread is drawn once at double width and cut in half, so anything
  * crossing the fold runs on exactly from one page to the next.
  */
-export async function renderPages(book: HTMLElement, size: { width: number; height: number }): Promise<Blob[]> {
+export function renderPages(book: HTMLElement, size: Size): Promise<Blob[]> {
+  return draw(book, size, true)
+}
+
+/**
+ * Draw each surface whole, in reading order: the cover and back at `size`,
+ * each spread as one picture twice as wide. For reading on a screen.
+ */
+export function renderSurfaces(book: HTMLElement, size: Size): Promise<Blob[]> {
+  return draw(book, size, false)
+}
+
+async function draw(book: HTMLElement, size: Size, splitSpreads: boolean): Promise<Blob[]> {
   // Hide selection and hover outlines while drawing.
   book.classList.add('is-exporting')
   try {
-    return await drawPages(book, size)
+    // Embed the fonts once for every surface, rather than once per surface.
+    const fontEmbedCSS = await getFontEmbedCSS(book)
+    const out: Blob[] = []
+    for (const surface of book.querySelectorAll<HTMLElement>('.surface')) {
+      const pages = surface.classList.contains('surface--spread') ? 2 : 1
+      const pixelRatio = (size.width * pages) / surface.offsetWidth
+      const drawn = await withOriginals(surface, pixelRatio, () =>
+        toCanvas(surface, { pixelRatio, fontEmbedCSS, filter: isPrintable }),
+      )
+      const pieces = splitSpreads ? pages : 1
+      for (let i = 0; i < pieces; i++) {
+        const piece = document.createElement('canvas')
+        piece.width = size.width * (pages / pieces)
+        piece.height = size.height
+        const sw = drawn.width / pieces
+        piece.getContext('2d')!.drawImage(drawn, sw * i, 0, sw, drawn.height, 0, 0, piece.width, piece.height)
+        out.push(await new Promise<Blob>((done) => piece.toBlob((b) => done(b!), 'image/jpeg', 0.9)))
+      }
+    }
+    return out
   } finally {
     book.classList.remove('is-exporting')
   }
-}
-
-async function drawPages(book: HTMLElement, size: { width: number; height: number }): Promise<Blob[]> {
-  // Embed the fonts once for every surface, rather than once per surface.
-  const fontEmbedCSS = await getFontEmbedCSS(book)
-  const pages: Blob[] = []
-
-  for (const surface of book.querySelectorAll<HTMLElement>('.surface')) {
-    const count = surface.classList.contains('surface--spread') ? 2 : 1
-    const pixelRatio = (size.width * count) / surface.offsetWidth
-    const drawn = await withOriginals(surface, pixelRatio, () =>
-      toCanvas(surface, { pixelRatio, fontEmbedCSS, filter: isPrintable }),
-    )
-    for (let i = 0; i < count; i++) {
-      const page = document.createElement('canvas')
-      page.width = size.width
-      page.height = size.height
-      const sw = drawn.width / count
-      page.getContext('2d')!.drawImage(drawn, sw * i, 0, sw, drawn.height, 0, 0, size.width, size.height)
-      pages.push(await new Promise<Blob>((done) => page.toBlob((b) => done(b!), 'image/jpeg', 0.92)))
-    }
-  }
-  return pages
 }
 
 /**

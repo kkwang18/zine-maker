@@ -2,13 +2,10 @@
 @import '@fontsource/inter/500.css';
 @import '@fontsource/inter/600.css';
 @import '@fontsource/dm-sans/400.css';
-@import '@fontsource/dm-sans/500.css';
-@import '@fontsource/dm-sans/700.css';
 @import '@fontsource/bagel-fat-one/400.css';
 @import '@fontsource/inter-tight/700.css';
 @import '@fontsource/eb-garamond/400.css';
 @import '@fontsource/eb-garamond/400-italic.css';
-@import '@fontsource/ibm-plex-mono/400.css';
 @import '@fontsource/dm-serif-display/400.css';
 @import '@fontsource/anton/400.css';
 @import '@fontsource/space-mono/400.css';
@@ -23,9 +20,8 @@
   /* The app's own interface: Inter throughout, Inter Tight for flip-clock headings. */
   --ui: 'Inter', system-ui, sans-serif;
   --flip: 'Inter Tight', 'Inter', sans-serif;
-  /* Inside the zine (Magazine style). */
+  /* Inside the zine: the plain choice for added text boxes. */
   --sans: 'DM Sans', system-ui, sans-serif;
-  --mono: 'IBM Plex Mono', ui-monospace, monospace;
 
   color-scheme: light;
   font-family: var(--ui);

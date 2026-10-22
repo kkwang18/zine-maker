@@ -16,6 +16,7 @@ export function PhotoTray({ photos, draft, lookAlikes, selectedId, onSelect, onR
   const where = new Map<string, string>()
   draft?.forEach((surface, i) => {
     for (const id of surface.photoIds) if (id) where.set(id, surfaceLabel(draft, i))
+    for (const f of surface.free ?? []) where.set(f.photoId, surfaceLabel(draft, i))
   })
 
   return (

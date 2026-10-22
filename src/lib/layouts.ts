@@ -505,6 +505,19 @@ export const LAYOUTS: Record<ZineStyle, Record<SurfaceKind, Template[]>> = {
   },
 }
 
+// A blank page or spread in every style, for building a layout by hand.
+// (New arrays, so the automatic sequence never picks them.)
+for (const style of Object.keys(LAYOUTS) as ZineStyle[]) {
+  const library = LAYOUTS[style]
+  LAYOUTS[style] = {
+    cover: [...library.cover, { id: `${style}-blank-cover`, slots: [], text: library.cover[0].text }],
+    spread: [...library.spread, { id: `${style}-blank-spread`, slots: [], text: [] }],
+    back: [...library.back, { id: `${style}-blank-back`, slots: [], text: library.back[0].text }],
+  }
+}
+
+export const isBlank = (id: string) => id.includes('-blank-')
+
 /** The layouts on offer for a style, with circle layouts added when they're turned on. */
 export function layoutsFor(style: ZineStyle, circles: boolean): Record<SurfaceKind, Template[]> {
   const base = LAYOUTS[style]
@@ -608,6 +621,7 @@ const LAYOUT_NAMES: Record<string, string> = {
 }
 
 export function layoutName(id: string): string {
+  if (isBlank(id)) return 'Blank: build your own'
   if (LAYOUT_NAMES[id]) return LAYOUT_NAMES[id]
   const [left, right] = id.split('|').map((p) => LAYOUT_NAMES[p] ?? p)
   return `Left ${left} · right ${right}`
