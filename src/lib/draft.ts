@@ -1,8 +1,24 @@
 import { arrange } from './arrange'
-import { fitPhoto } from './fit'
+import { fitPhoto, squareAround } from './fit'
 import { surfaceAspect } from './geometry'
 import { findLayout } from './layouts'
-import type { Draft, DraftSurface, FreePhoto, FreeText, PageColor, PaperSize, Photo, Rect, SlotAddress, Surface } from './types'
+import type {
+  Draft,
+  DraftSurface,
+  Frame,
+  FrameShape,
+  FreePhoto,
+  FreeText,
+  PageColor,
+  PaperSize,
+  Photo,
+  PhotoShape,
+  Rect,
+  Shape,
+  ShapeKind,
+  SlotAddress,
+  Surface,
+} from './types'
 
 /** Text boxes start above the photos. */
 const TEXT_Z = 100
@@ -26,6 +42,11 @@ function contain(box: Rect, aspect: number, surfaceAspect: number): Rect {
   return { x: box.x + (box.w - w) / 2, y: box.y + (box.h - h) / 2, w, h }
 }
 
+/** The shape a photo shows as: one picked by hand, else its layout's. */
+function frameShape(picked: FrameShape | undefined, layout?: PhotoShape): PhotoShape | undefined {
+  return picked === 'plain' ? undefined : (picked ?? layout)
+}
+
 /** Work out exact positions for every slot of every surface. */
 export function renderDraft(draft: Draft, photos: Map<string, Photo>, paper: PaperSize): Surface[] {
   return draft.map((s, i) => {
@@ -46,31 +67,45 @@ export function renderDraft(draft: Draft, photos: Map<string, Photo>, paper: Pap
       templateId: template.id,
       text: template.text,
       texts: s.texts ?? [],
+      shapes: s.shapes ?? [],
       color: s.color,
       free: (s.free ?? []).flatMap((f) => {
         const photo = photos.get(f.photoId)
         if (!photo) return []
-        return [{ id: f.id, z: f.z, placement: { photoId: photo.id, dest: contain(f.box, photo.aspect, aspect), src: FULL } }]
+        const shape = frameShape(f.shape)
+        // A circle shows the square around the subject, as the largest square in the box.
+        const placement =
+          shape === 'circle'
+            ? { photoId: photo.id, dest: contain(f.box, 1, aspect), src: squareAround(photo), shape }
+            : { photoId: photo.id, dest: contain(f.box, photo.aspect, aspect), src: FULL, shape }
+        return [{ id: f.id, z: f.z, locked: Boolean(f.locked), placement }]
       }),
       slots: template.slots.map((slot, j) => {
         const frame = s.frames?.[j]
         const z = frame?.z ?? j
         const moved = Boolean(frame?.box)
+        const locked = Boolean(frame?.locked)
         const id = s.photoIds[j]
         const photo = id ? photos.get(id) : undefined
         const home = fitted?.[j] ?? slot.rect
-        if (!photo) return { rect: frame?.box ?? home, placement: null, z, moved }
+        if (!photo) return { rect: frame?.box ?? home, placement: null, z, moved, locked }
+        const shape = frameShape(frame?.shape, slot.shape)
         if (fitted) {
+          const box = frame?.box ?? home
           // The frame already has the photo's shape: the whole photo, uncropped.
-          const dest = frame?.box ? contain(frame.box, photo.aspect, aspect) : home
-          return { rect: home, placement: { photoId: photo.id, dest, src: FULL, shape: slot.shape }, z, moved }
+          const placement =
+            shape === 'circle'
+              ? { photoId: photo.id, dest: contain(box, 1, aspect), src: squareAround(photo), shape }
+              : { photoId: photo.id, dest: frame?.box ? contain(box, photo.aspect, aspect) : home, src: FULL, shape }
+          return { rect: home, placement, z, moved, locked }
         }
         // A photo placed by hand in a fill slot it can't fill with a small crop
         // is framed inside the slot instead — never cropped further.
-        const fit = fitPhoto(photo, slot, aspect) ?? fitPhoto(photo, { ...slot, mode: 'fit' }, aspect)!
+        const asked = { ...slot, shape }
+        const fit = fitPhoto(photo, asked, aspect) ?? fitPhoto(photo, { ...asked, mode: 'fit' }, aspect)!
         // Moved by hand: the photo (as cropped, if at all) keeps its shape inside the new box.
         const dest = frame?.box ? contain(frame.box, (photo.aspect * fit.src.w) / fit.src.h, aspect) : fit.dest
-        return { rect: slot.rect, placement: { photoId: photo.id, dest, src: fit.src, shape: slot.shape }, z, moved }
+        return { rect: slot.rect, placement: { photoId: photo.id, dest, src: fit.src, shape }, z, moved, locked }
       }),
     }
   })
@@ -201,7 +236,7 @@ export function moveFree(draft: Draft, surface: number, id: string, box: Rect): 
 
 // ── Arranging by hand ───────────────────────────────────────────────────────
 
-function withFrame(draft: Draft, at: SlotAddress, change: (f: { box?: Rect; z?: number }) => { box?: Rect; z?: number }): Draft {
+function withFrame(draft: Draft, at: SlotAddress, change: (f: Frame) => Frame): Draft {
   return updateSurface(draft, at.surface, (s) => {
     const frames = s.photoIds.map((_, j) => s.frames?.[j] ?? null)
     frames[at.slot] = change(frames[at.slot] ?? {})
@@ -213,21 +248,35 @@ export function moveFrame(draft: Draft, at: SlotAddress, box: Rect): Draft {
   return withFrame(draft, at, (f) => ({ ...f, box }))
 }
 
-/** Put a moved photo back where its layout had it (keeping its place in the stack). */
+/** Put a moved photo back where its layout had it (keeping its place in the stack and its shape). */
 export function resetFrame(draft: Draft, at: SlotAddress): Draft {
-  return withFrame(draft, at, (f) => ({ z: f.z }))
+  return withFrame(draft, at, (f) => ({ z: f.z, locked: f.locked, shape: f.shape }))
 }
 
-/** Every stacking position in use on a surface: photos and text boxes. */
+/** Give one photo a frame shape, wherever it is. */
+export function setFrameShape(draft: Draft, ref: PhotoRef, shape: FrameShape | undefined): Draft {
+  if (ref.type === 'slot') return withFrame(draft, ref.at, (f) => ({ ...f, shape }))
+  return updateSurface(draft, ref.surface, (s) => ({
+    ...s,
+    free: (s.free ?? []).map((f) => (f.id === ref.id ? { ...f, shape } : f)),
+  }))
+}
+
+/** Every stacking position in use on a surface: photos, shapes and text boxes. */
 function stack(s: DraftSurface): number[] {
   return [
     ...s.photoIds.map((_, j) => s.frames?.[j]?.z ?? j),
     ...(s.free ?? []).map((f) => f.z),
+    ...(s.shapes ?? []).map((f) => f.z),
     ...(s.texts ?? []).map((t) => t.z),
   ]
 }
 
-export type Layer = { type: 'slot'; slot: number } | { type: 'free'; id: string } | { type: 'text'; id: string }
+export type Layer =
+  | { type: 'slot'; slot: number }
+  | { type: 'free'; id: string }
+  | { type: 'shape'; id: string }
+  | { type: 'text'; id: string }
 
 /** Bring something to the front of its page, or send it to the back. */
 export function restack(draft: Draft, surface: number, item: Layer, direction: 'front' | 'back'): Draft {
@@ -239,7 +288,62 @@ export function restack(draft: Draft, surface: number, item: Layer, direction: '
       ...s,
       free: (s.free ?? []).map((f) => (f.id === item.id ? { ...f, z } : f)),
     }))
+  if (item.type === 'shape') return updateShape(draft, surface, item.id, { z })
   return updateText(draft, surface, item.id, { z })
+}
+
+// ── Shapes ──────────────────────────────────────────────────────────────────
+
+/** A rule's thickness when first drawn, as a fraction of the surface's height. */
+const LINE_THICKNESS = 0.008
+
+/**
+ * Add a shape to a page: centred on it (the right-hand page of a spread),
+ * behind the photos, so a colour block sits underneath them.
+ */
+export function addShape(
+  draft: Draft,
+  surface: number,
+  kind: ShapeKind,
+  color: PageColor,
+  surfaceAspect: number,
+): { draft: Draft; id: string } {
+  const s = draft[surface]
+  const spread = s.kind === 'spread'
+  const page = spread ? 0.5 : 1
+  const cx = spread ? 0.75 : 0.5
+  // Widths are a share of the page; heights follow in physical proportion.
+  const w = page * (kind === 'line' ? 0.6 : kind === 'ellipse' ? 0.36 : 0.5)
+  const h = kind === 'line' ? LINE_THICKNESS : kind === 'ellipse' ? w * surfaceAspect : w * surfaceAspect * 0.66
+  // Just under the lowest photo or text; shapes already down there step back
+  // one, so the new one sits on top of them.
+  const z = Math.min(0, ...stack({ ...s, shapes: [] })) - 1
+  const shape: Shape = {
+    id: crypto.randomUUID(),
+    kind,
+    box: { x: cx - w / 2, y: 0.5 - h / 2, w, h },
+    color,
+    opacity: 1,
+    z,
+  }
+  return {
+    draft: updateSurface(draft, surface, (x) => ({
+      ...x,
+      shapes: [...(x.shapes ?? []).map((f) => (f.z <= z ? { ...f, z: f.z - 1 } : f)), shape],
+    })),
+    id: shape.id,
+  }
+}
+
+export function updateShape(draft: Draft, surface: number, id: string, change: Partial<Shape>): Draft {
+  return updateSurface(draft, surface, (s) => ({
+    ...s,
+    shapes: (s.shapes ?? []).map((f) => (f.id === id ? { ...f, ...change } : f)),
+  }))
+}
+
+export function removeShape(draft: Draft, surface: number, id: string): Draft {
+  return updateSurface(draft, surface, (s) => ({ ...s, shapes: (s.shapes ?? []).filter((f) => f.id !== id) }))
 }
 
 // ── Text boxes ──────────────────────────────────────────────────────────────
@@ -292,4 +396,123 @@ export function removeSpread(draft: Draft, i: number): Draft {
 
 export function setSurfaceColor(draft: Draft, i: number, color: PageColor | undefined): Draft {
   return updateSurface(draft, i, (s) => ({ ...s, color }))
+}
+
+// ── Precise editing: any item, by its layer ─────────────────────────────────
+
+/** Is this item locked against moving and deleting? */
+export function isLocked(draft: Draft, surface: number, item: Layer): boolean {
+  const s = draft[surface]
+  if (item.type === 'slot') return Boolean(s.frames?.[item.slot]?.locked)
+  if (item.type === 'free') return Boolean(s.free?.find((f) => f.id === item.id)?.locked)
+  if (item.type === 'shape') return Boolean(s.shapes?.find((f) => f.id === item.id)?.locked)
+  return Boolean(s.texts?.find((t) => t.id === item.id)?.locked)
+}
+
+export function setLocked(draft: Draft, surface: number, item: Layer, locked: boolean): Draft {
+  if (item.type === 'slot') return withFrame(draft, { surface, slot: item.slot }, (f) => ({ ...f, locked }))
+  if (item.type === 'free')
+    return updateSurface(draft, surface, (s) => ({
+      ...s,
+      free: (s.free ?? []).map((f) => (f.id === item.id ? { ...f, locked } : f)),
+    }))
+  if (item.type === 'shape') return updateShape(draft, surface, item.id, { locked })
+  return updateText(draft, surface, item.id, { locked })
+}
+
+/**
+ * Put an item at an exact position and size (surface fractions). Photos keep
+ * their shape inside the box; shapes take it exactly; text boxes take the
+ * position and width, and their height follows the words.
+ */
+export function placeItem(draft: Draft, surface: number, item: Layer, rect: Rect): Draft {
+  if (item.type === 'slot') return moveFrame(draft, { surface, slot: item.slot }, rect)
+  if (item.type === 'free') return moveFree(draft, surface, item.id, rect)
+  if (item.type === 'shape') return updateShape(draft, surface, item.id, { box: rect })
+  return updateText(draft, surface, item.id, { x: rect.x, y: rect.y, w: rect.w })
+}
+
+/** How far a copy sits from the original, so both can be seen. */
+const COPY_OFFSET = 0.03
+
+/**
+ * Copy an item onto the same page, slightly offset, on top. A photo from a
+ * layout slot is copied as a freely placed photo (the same picture can appear
+ * twice if asked for). Returns the new item.
+ */
+export function duplicate(
+  draft: Draft,
+  surface: number,
+  item: Layer,
+  rect: Rect,
+): { draft: Draft; item: Layer } {
+  const s = draft[surface]
+  const z = Math.max(...stack(s)) + 1
+  const box = { ...rect, x: rect.x + COPY_OFFSET, y: rect.y + COPY_OFFSET }
+  if (item.type === 'text') {
+    const original = s.texts?.find((t) => t.id === item.id)
+    if (!original) return { draft, item }
+    const copy = { ...original, id: crypto.randomUUID(), x: box.x, y: box.y, z, locked: false }
+    return { draft: updateSurface(draft, surface, (x) => ({ ...x, texts: [...(x.texts ?? []), copy] })), item: { type: 'text', id: copy.id } }
+  }
+  if (item.type === 'shape') {
+    const original = s.shapes?.find((f) => f.id === item.id)
+    if (!original) return { draft, item }
+    const copy = { ...original, id: crypto.randomUUID(), box, z, locked: false }
+    return { draft: updateSurface(draft, surface, (x) => ({ ...x, shapes: [...(x.shapes ?? []), copy] })), item: { type: 'shape', id: copy.id } }
+  }
+  const original = item.type === 'slot' ? {
+          photoId: s.photoIds[item.slot],
+          // A copy keeps the photo's look, even a shape that came with the layout.
+          shape: s.frames?.[item.slot]?.shape ?? findLayout(s.kind, s.templateId).slots[item.slot]?.shape,
+        } : s.free?.find((f) => f.id === item.id)
+  const photoId = original?.photoId
+  if (!photoId) return { draft, item }
+  const copy: FreePhoto = { id: crypto.randomUUID(), photoId, box, z, shape: original.shape }
+  return { draft: updateSurface(draft, surface, (x) => ({ ...x, free: [...(x.free ?? []), copy] })), item: { type: 'free', id: copy.id } }
+}
+
+/** Line items up with each other (or, for one item, with `bounds`, its page). */
+export function alignRects(rects: Rect[], how: Align, bounds?: Rect): Rect[] {
+  const box = bounds ?? {
+    x: Math.min(...rects.map((r) => r.x)),
+    y: Math.min(...rects.map((r) => r.y)),
+    w: Math.max(...rects.map((r) => r.x + r.w)) - Math.min(...rects.map((r) => r.x)),
+    h: Math.max(...rects.map((r) => r.y + r.h)) - Math.min(...rects.map((r) => r.y)),
+  }
+  return rects.map((r) => {
+    switch (how) {
+      case 'left':
+        return { ...r, x: box.x }
+      case 'centre':
+        return { ...r, x: box.x + (box.w - r.w) / 2 }
+      case 'right':
+        return { ...r, x: box.x + box.w - r.w }
+      case 'top':
+        return { ...r, y: box.y }
+      case 'middle':
+        return { ...r, y: box.y + (box.h - r.h) / 2 }
+      case 'bottom':
+        return { ...r, y: box.y + box.h - r.h }
+    }
+  })
+}
+
+export type Align = 'left' | 'centre' | 'right' | 'top' | 'middle' | 'bottom'
+
+/** Space items evenly between the outermost two, across or down. */
+export function distributeRects(rects: Rect[], axis: 'x' | 'y'): Rect[] {
+  const size = axis === 'x' ? 'w' : 'h'
+  const order = rects.map((r, i) => ({ r, i })).sort((a, b) => a.r[axis] - b.r[axis])
+  const first = order[0].r
+  const last = order[order.length - 1].r
+  const span = last[axis] + last[size] - first[axis]
+  const gap = (span - rects.reduce((n, r) => n + r[size], 0)) / (rects.length - 1)
+  const out = [...rects]
+  let at = first[axis]
+  for (const { r, i } of order) {
+    out[i] = { ...r, [axis]: at }
+    at += r[size] + gap
+  }
+  return out
 }

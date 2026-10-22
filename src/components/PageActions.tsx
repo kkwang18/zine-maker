@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { PAGE_COLORS } from '../lib/styles'
-import type { PageColor, SurfaceKind } from '../lib/types'
+import type { PageColor, ShapeKind, SurfaceKind } from '../lib/types'
 
 interface Props {
   kind: SurfaceKind
@@ -11,6 +11,7 @@ interface Props {
   canRemove: boolean
   onMove: (by: -1 | 1) => void
   onAddText: () => void
+  onAddShape: (kind: ShapeKind) => void
   onColor: (color: PageColor | undefined) => void
   onAddSpread: () => void
   onRemove: () => void
@@ -18,8 +19,9 @@ interface Props {
 
 /** Page-level controls: order, colour, text, and adding or removing spreads. */
 export function PageActions(props: Props) {
-  const { kind, color, onMove, onAddText, onColor, onAddSpread, onRemove } = props
+  const { kind, color, onMove, onAddText, onAddShape, onColor, onAddSpread, onRemove } = props
   const [picking, setPicking] = useState(false)
+  const [shaping, setShaping] = useState(false)
   const spread = kind === 'spread'
 
   return (
@@ -37,6 +39,31 @@ export function PageActions(props: Props) {
       <button className="pill pill--small" onClick={onAddText}>
         + Text
       </button>
+      <button className="pill pill--small" aria-expanded={shaping} onClick={() => setShaping(!shaping)}>
+        + Shape
+      </button>
+      {shaping && (
+        <span className="page-actions__swatches" role="group" aria-label="Add a shape">
+          {(
+            [
+              ['rect', 'Rectangle'],
+              ['ellipse', 'Circle'],
+              ['line', 'Line'],
+            ] as const
+          ).map(([k, label]) => (
+            <button
+              key={k}
+              className="chip"
+              onClick={() => {
+                onAddShape(k)
+                setShaping(false)
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </span>
+      )}
       <button
         className="pill pill--small"
         aria-expanded={picking}

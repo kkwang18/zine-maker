@@ -9,20 +9,20 @@ export const SLIDES_PER_POST = 20
  */
 export function carouselPosts(perSurface: number[]): number[][] {
   const total = perSurface.reduce((n, k) => n + k, 0)
-  const target = Math.ceil(total / Math.ceil(total / SLIDES_PER_POST))
-  const posts: number[][] = [[]]
-  let slide = 0
-  for (const count of perSurface) {
-    const current = posts[posts.length - 1]
-    if (current.length && current.length + count > target) posts.push([])
-    for (let k = 0; k < count; k++) posts[posts.length - 1].push(slide++)
+  // Fill posts in order, starting a new one whenever the next surface won't fit under `cap`.
+  const fill = (cap: number) => {
+    const posts: number[][] = [[]]
+    let slide = 0
+    for (const count of perSurface) {
+      if (posts[posts.length - 1].length + count > cap) posts.push([])
+      for (let k = 0; k < count; k++) posts[posts.length - 1].push(slide++)
+    }
+    return posts
   }
-  // Don't leave a straggler (often just the back cover) as a post of its own.
-  const last = posts[posts.length - 1]
-  const before = posts[posts.length - 2]
-  if (before && last.length < target / 2 && before.length + last.length <= SLIDES_PER_POST) {
-    before.push(...last)
-    posts.pop()
-  }
-  return posts
+  // As few posts as possible, then the smallest cap that still needs no more,
+  // so posts come out even and the back cover is never stranded on its own.
+  const fewest = fill(SLIDES_PER_POST).length
+  let cap = Math.max(...perSurface, Math.ceil(total / fewest))
+  while (fill(cap).length > fewest) cap++
+  return fill(cap)
 }

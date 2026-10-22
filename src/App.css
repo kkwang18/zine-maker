@@ -592,6 +592,8 @@
   width: 100%;
   overflow: hidden;
   background: var(--page);
+  /* Its own stack: things sent behind the photos (below zero) still sit on the page, not under it. */
+  isolation: isolate;
   container-type: inline-size;
   /* One unit = 1% of a page's width, on pages and spreads alike. */
   --u: 1cqw;
@@ -651,6 +653,25 @@
 }
 
 .placed__clip--circle {
+  border-radius: 50%;
+}
+
+/* An oversized radius is scaled down to fit, so the top becomes a half circle as wide as the photo. */
+.placed__clip--arch {
+  border-radius: 9999px 9999px 0 0;
+}
+
+.placed__clip--pill {
+  border-radius: 9999px;
+}
+
+/* Shapes: colour blocks, dots and rules. */
+.shape__fill {
+  position: absolute;
+  inset: 0;
+}
+
+.shape--ellipse .shape__fill {
   border-radius: 50%;
 }
 
@@ -758,6 +779,27 @@
   max-width: 88%;
   font-size: calc(var(--u) * 3);
   line-height: 1.5;
+}
+
+/* Page numbers and running heads: small, in the zine's font, above the pictures. */
+.folio {
+  position: absolute;
+  z-index: 65;
+  color: var(--page-text);
+  font-family: var(--title-font);
+  font-size: calc(var(--u) * 2.6);
+  letter-spacing: 0.06em;
+  line-height: 1;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.folio--running {
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
 }
 
 /* ── Arranging by hand ─────────────────────────────────────── */
@@ -1010,6 +1052,75 @@
   color: var(--muted);
 }
 
+/* Arrange: exact numbers, alignment, duplicate, lock. */
+.fields {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.number-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px;
+  border: 1px solid #d5dde5;
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.number-field input {
+  width: 46px;
+  border: none;
+  background: none;
+  font-size: 12px;
+  color: var(--ink);
+  outline: none;
+}
+
+.number-field input:disabled {
+  color: var(--muted);
+}
+
+.chip--icon {
+  min-width: 26px;
+  font-size: 13px;
+}
+
+.chip:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.item--locked {
+  cursor: default !important;
+}
+
+.lock-badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  font-size: 12px;
+  line-height: 1;
+  filter: drop-shadow(0 0 2px rgb(255 255 255 / 0.9));
+  pointer-events: none;
+}
+
+/* Size while dragging, in real units. */
+.readout {
+  position: absolute;
+  z-index: 1001;
+  translate: 0 calc(-100% - 6px);
+  padding: 2px 7px;
+  background: var(--ink);
+  color: #fff;
+  border-radius: 999px;
+  font-family: var(--ui);
+  font-size: 11px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
 .chip {
   padding: 4px 9px;
   background: none;
@@ -1151,6 +1262,84 @@
   margin: 0;
   font-size: 13px;
   line-height: 1.45;
+}
+
+/* Download choices for print formats. */
+.download-option {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  cursor: pointer;
+  text-align: left;
+  font-size: 13px;
+}
+
+.download-option:hover {
+  background: #f2f7fb;
+  border-color: var(--ink);
+}
+
+.download-option span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* Preflight results. */
+.preflight {
+  width: min(460px, 92vw);
+}
+
+.issues {
+  max-height: 46vh;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.issue {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.issue span {
+  flex: 1;
+}
+
+.issue--warn {
+  background: #fff1ec;
+  border-left: 3px solid var(--accent);
+}
+
+.issue--info {
+  background: #eef5fb;
+  border-left: 3px solid #6f9fd0;
+}
+
+.badge {
+  display: inline-block;
+  min-width: 18px;
+  margin-left: 6px;
+  padding: 1px 5px;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
 }
 
 /* ── Preview ────────────────────────────────────────────────── */

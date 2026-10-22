@@ -83,11 +83,19 @@ function fitCircle(photo: Photo, slot: Slot, surfaceAspect: number): Fit {
   const w = side / surfaceAspect
   const dest = { x: rect.x + (rect.w - w) * align.x, y: rect.y + (rect.h - side) * align.y, w, h: side }
 
+  const src = squareAround(photo)
+  // Squarer photos lose less to the circle.
+  return { dest, src, quality: Math.sqrt(Math.min(src.w, src.h)) }
+}
+
+/**
+ * The largest square cut from the photo, centred on its subject as far as the
+ * edges allow. Circle layouts and circle frames both show this.
+ */
+export function squareAround(photo: Photo): Rect {
   const wide = photo.aspect >= 1
   const keep = wide ? 1 / photo.aspect : photo.aspect
   const focus = wide ? photo.stats.focus.x : photo.stats.focus.y
   const start = clamp(focus - keep / 2, 0, 1 - keep)
-  const src = wide ? { x: start, y: 0, w: keep, h: 1 } : { x: 0, y: start, w: 1, h: keep }
-  // Squarer photos lose less to the circle.
-  return { dest, src, quality: Math.sqrt(keep) }
+  return wide ? { x: start, y: 0, w: keep, h: 1 } : { x: 0, y: start, w: 1, h: keep }
 }

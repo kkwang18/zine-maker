@@ -26,9 +26,9 @@ export async function saveProject(doc: Doc, photos: PhotoData[]): Promise<Blob> 
   const entries = photos.map((p): PhotoEntry => {
     const ext = p.name.includes('.') ? p.name.slice(p.name.lastIndexOf('.')) : ''
     const file = `photos/${p.id}${ext}`
-    zip.file(file, p.file)
-    if (p.previewFile) zip.file(`previews/${p.id}.jpg`, p.previewFile)
-    if (p.thumbFile) zip.file(`thumbs/${p.id}.jpg`, p.thumbFile)
+    zip.file(file, p.file.arrayBuffer())
+    if (p.previewFile) zip.file(`previews/${p.id}.jpg`, p.previewFile.arrayBuffer())
+    if (p.thumbFile) zip.file(`thumbs/${p.id}.jpg`, p.thumbFile.arrayBuffer())
     const { file: _, previewFile: __, thumbFile: ___, stats, ...rest } = p
     return {
       ...rest,
@@ -44,7 +44,8 @@ export async function saveProject(doc: Doc, photos: PhotoData[]): Promise<Blob> 
 }
 
 export async function openProject(file: Blob): Promise<{ doc: Doc; photos: PhotoData[] }> {
-  const zip = await JSZip.loadAsync(file)
+  // Read as bytes rather than a Blob, which works in every environment (tests included).
+  const zip = await JSZip.loadAsync(await file.arrayBuffer())
   const manifest = zip.file('project.json')
   if (!manifest) throw new Error('This isn’t a zine project file.')
   const json = JSON.parse(await manifest.async('string')) as ProjectJson

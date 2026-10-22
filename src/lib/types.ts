@@ -51,7 +51,9 @@ export type PaperSize = 'letter' | 'a4' | 'instagram'
 /** The overall look: Quiet (sparse, black, after Fukase), Magazine (bright, playful) or Collage (big, overlapping). */
 export type ZineStyle = 'quiet' | 'magazine' | 'collage'
 export type PageColor = 'black' | 'white' | 'sky' | 'mint' | 'cream' | 'yellow' | 'red' | 'blue' | 'pink'
-export type PhotoShape = 'rounded' | 'circle'
+export type PhotoShape = 'rounded' | 'circle' | 'arch' | 'pill'
+/** A frame shape picked for one photo by hand; 'plain' undoes a layout's rounded or circle frame. */
+export type FrameShape = PhotoShape | 'plain'
 export type TitleFont = 'garamond' | 'dm-serif' | 'bagel' | 'anton' | 'space-mono'
 
 /** What a slot asks of the photo placed in it; drives which photo the sequencer picks. */
@@ -132,6 +134,10 @@ export interface Placement {
 export interface Frame {
   box?: Rect
   z?: number
+  /** Locked: can't be dragged, resized, nudged or deleted until unlocked. */
+  locked?: boolean
+  /** Shape picked by hand, instead of the layout's. */
+  shape?: FrameShape
 }
 
 export type TextSize = 's' | 'm' | 'l'
@@ -149,6 +155,7 @@ export interface FreeText {
   font: TextFont
   color: TextColor
   z: number
+  locked?: boolean
 }
 
 export type SurfaceKind = 'cover' | 'spread' | 'back'
@@ -160,6 +167,22 @@ export interface FreePhoto {
   /** The photo keeps its shape inside this box. */
   box: Rect
   z: number
+  locked?: boolean
+  shape?: FrameShape
+}
+
+export type ShapeKind = 'rect' | 'ellipse' | 'line'
+
+/** A design element: a colour block, a dot or a rule. Its box is in surface fractions. */
+export interface Shape {
+  id: string
+  kind: ShapeKind
+  box: Rect
+  color: PageColor
+  /** 1, 0.75, 0.5 or 0.25. */
+  opacity: number
+  z: number
+  locked?: boolean
 }
 
 /** The editable zine: a layout and a photo per slot for each surface, in reading order. */
@@ -173,6 +196,7 @@ export interface DraftSurface {
   texts?: FreeText[]
   /** Photos placed anywhere by hand, on top of (or instead of) the layout. */
   free?: FreePhoto[]
+  shapes?: Shape[]
   /** Page colour for just this surface, instead of the zine's. */
   color?: PageColor
 }
@@ -198,9 +222,11 @@ export interface Surface {
     z: number
     /** Moved or resized by hand. */
     moved: boolean
+    locked: boolean
   }[]
   text: TextBlock[]
   texts: FreeText[]
-  free: { id: string; placement: Placement; z: number }[]
+  free: { id: string; placement: Placement; z: number; locked: boolean }[]
+  shapes: Shape[]
   color?: PageColor
 }

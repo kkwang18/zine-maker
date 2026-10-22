@@ -8,7 +8,8 @@ import {
 } from 'react'
 import { snapEdge, snapMove, snapTargets, type Guides } from '../lib/snap'
 import { PAGE_COLORS, TITLE_FONTS } from '../lib/styles'
-import type { FreeText, Photo, Placement, Rect, Surface, TextBlock, TextKind, ZineStyle } from '../lib/types'
+import type { Folios } from '../lib/doc'
+import type { FreeText, Photo, Placement, Rect, Shape, Surface, TextBlock, TextKind, ZineStyle } from '../lib/types'
 import { isZineDrag } from './dragItem'
 
 /** Hooks for arranging the page by hand; leave out to draw the surface as it will print. */
@@ -16,20 +17,30 @@ export interface SurfaceEditor {
   selectedSlot: number | null
   selectedFree: string | null
   selectedText: string | null
+  selectedShape: string | null
+  /** Everything selected together on this page (Shift-click), as item keys: s0, f<id>, h<id>, t<id>. */
+  groupKeys: string[]
   editingText: string | null
   /** A photo is waiting to be swapped: other photos and empty slots light up as targets. */
   swapping: boolean
-  onSlotClick: (slot: number) => void
+  /** `additive`: Shift was held, to add or remove it from a multiple selection. */
+  onSlotClick: (slot: number, additive?: boolean) => void
   /** A photo dragged in from the tray. */
   onSlotDrop: (slot: number, e: DragEvent) => void
   onFrameChange: (slot: number, box: Rect) => void
-  onFreeClick: (id: string) => void
+  onFreeClick: (id: string, additive?: boolean) => void
   /** A photo dragged in from the tray onto a freely placed photo. */
   onFreeDrop: (id: string, e: DragEvent) => void
   onFreeChange: (id: string, box: Rect) => void
   /** A photo dragged in from the tray onto bare page, at `point` (surface fractions). */
   onPageDrop: (point: { x: number; y: number }, e: DragEvent) => void
-  onTextClick: (id: string) => void
+  onTextClick: (id: string, additive?: boolean) => void
+  onShapeClick: (id: string, additive?: boolean) => void
+  onShapeChange: (id: string, box: Rect) => void
+  /** Several selected items dragged together by (dx, dy), in surface fractions. */
+  onGroupMove: (dx: number, dy: number) => void
+  /** How to show a size or position while dragging, in real units. */
+  measure?: (rect: Rect) => string
   onTextEdit: (id: string) => void
   onTextChange: (id: string, change: Partial<FreeText>) => void
   onTextEditEnd: () => void
@@ -49,6 +60,8 @@ interface Props {
   seam?: 'fold' | 'slides' | 'none'
   /** Show centre lines, thirds and margins on each page, for lining things up. */
   showGuides?: boolean
+  /** Page numbers (one per page of this surface) and running head, for inside pages. */
+  folios?: { pages: number[]; numbers: boolean; position: Folios['position']; running: string }
 }
 
 const pct = (v: number) => `${v * 100}%`
@@ -59,7 +72,11 @@ const TEXT_SIZE = { s: 3, m: 5, l: 9 }
 const TEXT_COLOR = { auto: 'var(--page-text)', black: '#0a0a0a', white: '#ffffff' }
 
 type Corner = 'nw' | 'ne' | 'sw' | 'se'
-type Item = { type: 'slot'; slot: number } | { type: 'free'; id: string } | { type: 'text'; id: string }
+type Item =
+  | { type: 'slot'; slot: number }
+  | { type: 'free'; id: string }
+  | { type: 'shape'; id: string }
+  | { type: 'text'; id: string }
 
 interface Gesture {
   item: Item
@@ -70,8 +87,18 @@ interface Gesture {
   size: { w: number; h: number }
   targets: Guides
   moved: boolean
+  /** Shift held: a click adds to (or removes from) the selection instead of replacing it. */
+  additive: boolean
+  /** Locked items can be clicked to select, but not dragged. */
+  locked: boolean
+  /** Shapes stretch freely from a corner (Shift keeps their proportions); photos always keep theirs. */
+  stretch: boolean
+  /** Shift held right now, while dragging. */
+  shift?: boolean
   /** The element being dragged; moved directly, without re-rendering, until the drop. */
   el: HTMLElement
+  /** Other selected items that move along with it. */
+  companions: HTMLElement[]
   /** Where the item is now, while dragging. */
   last?: Rect
   /** Latest pointer position, applied once per animation frame. */
@@ -84,11 +111,19 @@ const DRAG_START = 4
 /** How close, in pixels, before something snaps to a guide. */
 const SNAP = 6
 const MIN_SIZE = 0.04
+/** A rule can be much thinner than anything else, but not vanish. */
+const MIN_THICKNESS = 0.003
 
 const sameGuides = (a: Guides, b: Guides) => a.x.join() === b.x.join() && a.y.join() === b.y.join()
 
 const itemKey = (item: Item) =>
-  item.type === 'slot' ? `s${item.slot}` : item.type === 'free' ? `f${item.id}` : `t${item.id}`
+  item.type === 'slot'
+    ? `s${item.slot}`
+    : item.type === 'free'
+      ? `f${item.id}`
+      : item.type === 'shape'
+        ? `h${item.id}`
+        : `t${item.id}`
 
 /** Margin of the layout guides, as a share of the page. */
 const MARGIN = 0.06
@@ -115,21 +150,24 @@ export function SurfaceView({
   onWordsClick,
   seam = 'fold',
   showGuides = false,
+  folios,
 }: Props) {
   const root = useRef<HTMLDivElement>(null)
   const gesture = useRef<Gesture | null>(null)
+  // The size readout while dragging, updated directly like the dragged item.
+  const readout = useRef<HTMLDivElement>(null)
   const [guides, setGuides] = useState<Guides>({ x: [], y: [] })
 
   const colors = surface.color
     ? { '--page': PAGE_COLORS[surface.color].page, '--page-text': PAGE_COLORS[surface.color].text }
     : {}
 
-  /** Where everything else on the page is, for snapping to. */
-  const otherRects = (except: Item): Rect[] => {
+  /** Where everything else on the page is (all but the `except` keys), for snapping to. */
+  const otherRects = (except: string[]): Rect[] => {
     const el = root.current!
     const bounds = el.getBoundingClientRect()
     return [...el.querySelectorAll<HTMLElement>('[data-item]')]
-      .filter((node) => node.dataset.item !== itemKey(except))
+      .filter((node) => !except.includes(node.dataset.item!))
       .map((node) => {
         const r = node.getBoundingClientRect()
         return {
@@ -141,17 +179,32 @@ export function SurfaceView({
       })
   }
 
-  const begin = (e: ReactPointerEvent, item: Item, action: Gesture['action'], start: Rect) => {
+  const begin = (e: ReactPointerEvent, item: Item, action: Gesture['action'], start: Rect, locked = false) => {
     if (!editor || e.button !== 0) return
     e.stopPropagation()
     const bounds = root.current!.getBoundingClientRect()
+    const key = itemKey(item)
+    // Dragging one of several selected items moves them all.
+    const group = action === 'move' && editor.groupKeys.length > 1 && editor.groupKeys.includes(key)
     gesture.current = {
+      additive: e.shiftKey,
+      locked,
+      stretch: item.type === 'shape',
+      companions: group
+        ? editor.groupKeys
+            .filter((k) => k !== key)
+            .flatMap((k) => root.current!.querySelector<HTMLElement>(`[data-item="${k}"]`) ?? [])
+        : [],
       item,
       action,
       start,
       pointer: { x: e.clientX, y: e.clientY },
       size: { w: bounds.width, h: bounds.height },
-      targets: withPageGuides(snapTargets(otherRects(item), surface.kind === 'spread'), surface.kind === 'spread'),
+      // Things moving together don't snap to each other.
+      targets: withPageGuides(
+        snapTargets(otherRects(group ? editor.groupKeys : [key]), surface.kind === 'spread'),
+        surface.kind === 'spread',
+      ),
       moved: action !== 'move',
       el: root.current!.querySelector<HTMLElement>(`[data-item="${itemKey(item)}"]`)!,
     }
@@ -169,6 +222,7 @@ export function SurfaceView({
     const g = gesture.current
     if (!g) return
     g.pending = { x: e.clientX, y: e.clientY }
+    g.shift = e.shiftKey
     g.frame ??= requestAnimationFrame(() => apply(g))
   }
 
@@ -178,10 +232,10 @@ export function SurfaceView({
     if (!g.pending || gesture.current !== g) return
     const px = g.pending.x - g.pointer.x
     const py = g.pending.y - g.pointer.y
-    if (!g.moved && Math.hypot(px, py) < DRAG_START) return
+    if (g.locked || (!g.moved && Math.hypot(px, py) < DRAG_START)) return
     if (!g.moved) {
       g.moved = true
-      g.el.classList.add('item--dragging')
+      for (const el of [g.el, ...g.companions]) el.classList.add('item--dragging')
     }
     const dx = px / g.size.w
     const dy = py / g.size.h
@@ -196,13 +250,23 @@ export function SurfaceView({
       const [right, guide] = snapEdge(s.x + Math.max(MIN_SIZE, s.w + dx), g.targets.x, threshold.x)
       rect = { ...s, w: Math.max(MIN_SIZE, right - s.x) }
       if (guide !== null) lines = { x: [guide], y: [] }
+    } else if (g.stretch && !g.shift) {
+      // Stretch a shape from a corner, each way on its own; the opposite corner stays put.
+      const west = g.action === 'nw' || g.action === 'sw'
+      const north = g.action === 'nw' || g.action === 'ne'
+      const [xEdge, xGuide] = snapEdge(west ? s.x + dx : s.x + s.w + dx, g.targets.x, threshold.x)
+      const [yEdge, yGuide] = snapEdge(north ? s.y + dy : s.y + s.h + dy, g.targets.y, threshold.y)
+      const w = Math.max(MIN_THICKNESS, west ? s.x + s.w - xEdge : xEdge - s.x)
+      const h = Math.max(MIN_THICKNESS, north ? s.y + s.h - yEdge : yEdge - s.y)
+      rect = { x: west ? s.x + s.w - w : s.x, y: north ? s.y + s.h - h : s.y, w, h }
+      lines = { x: xGuide === null ? [] : [xGuide], y: yGuide === null ? [] : [yGuide] }
     } else {
-      // Resize from a corner, keeping the photo's shape; the opposite corner stays put.
+      // Resize from a corner, keeping the item's shape; the opposite corner stays put.
       const west = g.action === 'nw' || g.action === 'sw'
       const north = g.action === 'nw' || g.action === 'ne'
       const movingEdge = west ? s.x + dx : s.x + s.w + dx
       const [edge, guide] = snapEdge(movingEdge, g.targets.x, threshold.x)
-      const w = Math.max(MIN_SIZE, west ? s.x + s.w - edge : edge - s.x)
+      const w = Math.max(g.stretch ? MIN_THICKNESS : MIN_SIZE, west ? s.x + s.w - edge : edge - s.x)
       const h = (w * s.h) / s.w
       rect = { x: west ? s.x + s.w - w : s.x, y: north ? s.y + s.h - h : s.y, w, h }
       if (guide !== null) lines = { x: [guide], y: [] }
@@ -217,6 +281,14 @@ export function SurfaceView({
       const tx = (rect.x - s.x) * g.size.w
       const ty = (rect.y - s.y) * g.size.h
       g.el.style.transform = `translate(${tx}px, ${ty}px) scale(${rect.w / s.w}, ${rect.h / s.h})`
+      for (const el of g.companions) el.style.transform = `translate(${tx}px, ${ty}px)`
+    }
+    const label = readout.current
+    if (label && editor?.measure) {
+      label.hidden = false
+      label.textContent = editor.measure(rect)
+      label.style.left = pct(rect.x)
+      label.style.top = pct(rect.y)
     }
     // Only re-render for the guides when they actually change.
     setGuides((prev) => (sameGuides(prev, lines) ? prev : lines))
@@ -229,19 +301,25 @@ export function SurfaceView({
     if (g.pending) apply(g)
     gesture.current = null
     // Hand the final position back to React, which redraws the item there in this same frame.
-    g.el.classList.remove('item--dragging')
-    g.el.style.transform = ''
+    for (const el of [g.el, ...g.companions]) {
+      el.classList.remove('item--dragging')
+      el.style.transform = ''
+    }
+    if (readout.current) readout.current.hidden = true
     setGuides({ x: [], y: [] })
     const result = g.last
     if (!g.moved || !result) {
       // A press without a drag is a click.
-      if (g.item.type === 'slot') editor.onSlotClick(g.item.slot)
-      else if (g.item.type === 'free') editor.onFreeClick(g.item.id)
-      else editor.onTextClick(g.item.id)
+      if (g.item.type === 'slot') editor.onSlotClick(g.item.slot, g.additive)
+      else if (g.item.type === 'free') editor.onFreeClick(g.item.id, g.additive)
+      else if (g.item.type === 'shape') editor.onShapeClick(g.item.id, g.additive)
+      else editor.onTextClick(g.item.id, g.additive)
       return
     }
-    if (g.item.type === 'slot') editor.onFrameChange(g.item.slot, result)
+    if (g.companions.length) editor.onGroupMove(result.x - g.start.x, result.y - g.start.y)
+    else if (g.item.type === 'slot') editor.onFrameChange(g.item.slot, result)
     else if (g.item.type === 'free') editor.onFreeChange(g.item.id, result)
+    else if (g.item.type === 'shape') editor.onShapeChange(g.item.id, result)
     else editor.onTextChange(g.item.id, { x: result.x, y: result.y, w: result.w })
   }
 
@@ -275,7 +353,22 @@ export function SurfaceView({
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
     >
-      {surface.slots.map(({ rect, placement, z, moved }, i) => {
+      {surface.shapes.map((shape) => {
+        const item: Item = { type: 'shape', id: shape.id }
+        return (
+          <ShapeItem
+            key={shape.id}
+            shape={shape}
+            editable={Boolean(editor)}
+            selected={editor?.selectedShape === shape.id}
+            grouped={Boolean(editor?.groupKeys.includes(itemKey(item)))}
+            onBegin={(e, action) => begin(e, item, action, shape.box, Boolean(shape.locked))}
+            onActivate={() => editor?.onShapeClick(shape.id)}
+          />
+        )
+      })}
+
+      {surface.slots.map(({ rect, placement, z, moved, locked }, i) => {
         const photo = placement ? photos.get(placement.photoId) : undefined
         if (!photo || !placement) {
           return editor ? <EmptySlot key={i} index={i} rect={rect} editor={editor} /> : null
@@ -289,16 +382,18 @@ export function SurfaceView({
             photo={photo}
             z={z}
             moved={moved}
+            locked={locked}
             editable={Boolean(editor)}
             selected={editor?.selectedSlot === i}
-            onBegin={(e, action) => begin(e, item, action, placement.dest)}
+            grouped={Boolean(editor?.groupKeys.includes(itemKey(item)))}
+            onBegin={(e, action) => begin(e, item, action, placement.dest, locked)}
             onActivate={() => editor?.onSlotClick(i)}
             onDropPhoto={(e) => editor?.onSlotDrop(i, e)}
           />
         )
       })}
 
-      {surface.free.map(({ id, placement, z }) => {
+      {surface.free.map(({ id, placement, z, locked }) => {
         const photo = photos.get(placement.photoId)
         if (!photo) return null
         const item: Item = { type: 'free', id }
@@ -310,9 +405,11 @@ export function SurfaceView({
             photo={photo}
             z={z}
             moved={false}
+            locked={locked}
             editable={Boolean(editor)}
             selected={editor?.selectedFree === id}
-            onBegin={(e, action) => begin(e, item, action, placement.dest)}
+            grouped={Boolean(editor?.groupKeys.includes(itemKey(item)))}
+            onBegin={(e, action) => begin(e, item, action, placement.dest, locked)}
             onActivate={() => editor?.onFreeClick(id)}
             onDropPhoto={(e) => editor?.onFreeDrop(id, e)}
           />
@@ -330,14 +427,19 @@ export function SurfaceView({
             key={t.id}
             text={t}
             editor={editor}
-            onBegin={(e, action, rect) => begin(e, item, action, rect)}
+            grouped={Boolean(editor?.groupKeys.includes(itemKey(item)))}
+            onBegin={(e, action, rect) => begin(e, item, action, rect, Boolean(t.locked))}
           />
         )
       })}
 
+      {folios && <PageFolios {...folios} />}
+
       {surface.kind === 'spread' && seam !== 'none' && <div className={`surface__seam surface__seam--${seam}`} />}
 
       {showGuides && editor && <LayoutGuides spread={surface.kind === 'spread'} />}
+
+      {editor && <div ref={readout} className="readout edit-ui" hidden />}
 
       {guides.x.map((x) => (
         <div key={`x${x}`} className="guide guide--v edit-ui" style={{ left: pct(x) }} />
@@ -396,8 +498,10 @@ function PhotoItem({
   photo,
   z,
   moved,
+  locked,
   editable,
   selected,
+  grouped,
   onBegin,
   onActivate,
   onDropPhoto,
@@ -407,8 +511,11 @@ function PhotoItem({
   photo: Photo
   z: number
   moved: boolean
+  locked: boolean
   editable: boolean
   selected: boolean
+  /** Part of a multiple selection. */
+  grouped: boolean
   onBegin: (e: ReactPointerEvent, action: 'move' | Corner) => void
   /** Keyboard Enter or Space: the same as clicking it. */
   onActivate: () => void
@@ -427,9 +534,10 @@ function PhotoItem({
   const classes = [
     'item',
     editor && 'item--editable',
-    selected && 'item--selected',
+    (selected || grouped) && 'item--selected',
     over && 'item--over',
     moved && 'item--moved',
+    locked && 'item--locked',
   ]
   return (
     <div
@@ -482,9 +590,70 @@ function PhotoItem({
         />
       </div>
       {selected &&
+        !grouped &&
+        !locked &&
         (['nw', 'ne', 'sw', 'se'] as Corner[]).map((c) => (
           <span key={c} className={`handle handle--${c} edit-ui`} onPointerDown={(e) => onBegin(e, c)} />
         ))}
+      {editable && locked && <span className="lock-badge edit-ui" aria-label="Locked">🔒</span>}
+    </div>
+  )
+}
+
+/** A colour block, dot or rule. Its colour is one of the page colours. */
+function ShapeItem({
+  shape,
+  editable,
+  selected,
+  grouped,
+  onBegin,
+  onActivate,
+}: {
+  shape: Shape
+  editable: boolean
+  selected: boolean
+  grouped: boolean
+  onBegin: (e: ReactPointerEvent, action: 'move' | Corner) => void
+  onActivate: () => void
+}) {
+  const label = { rect: 'Rectangle', ellipse: 'Circle', line: 'Line' }[shape.kind]
+  const classes = [
+    'item',
+    'shape',
+    `shape--${shape.kind}`,
+    editable && 'item--editable',
+    (selected || grouped) && 'item--selected',
+    shape.locked && 'item--locked',
+  ]
+  return (
+    <div
+      className={classes.filter(Boolean).join(' ')}
+      style={{ ...box(shape.box), zIndex: shape.z + 1 }}
+      data-item={`h${shape.id}`}
+      data-keep-selection
+      role={editable ? 'button' : undefined}
+      tabIndex={editable ? 0 : undefined}
+      aria-label={editable ? label : undefined}
+      onPointerDown={editable ? (e) => onBegin(e, 'move') : undefined}
+      onKeyDown={
+        editable
+          ? (e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                onActivate()
+              }
+            }
+          : undefined
+      }
+    >
+      <div className="shape__fill" style={{ background: PAGE_COLORS[shape.color].page, opacity: shape.opacity }} />
+      {selected &&
+        !grouped &&
+        !shape.locked &&
+        (['nw', 'ne', 'sw', 'se'] as Corner[]).map((c) => (
+          <span key={c} className={`handle handle--${c} edit-ui`} onPointerDown={(e) => onBegin(e, c)} />
+        ))}
+      {editable && shape.locked && <span className="lock-badge edit-ui" aria-label="Locked">🔒</span>}
     </div>
   )
 }
@@ -492,10 +661,12 @@ function PhotoItem({
 function TextItem({
   text,
   editor,
+  grouped,
   onBegin,
 }: {
   text: FreeText
   editor?: SurfaceEditor
+  grouped: boolean
   onBegin: (e: ReactPointerEvent, action: 'move' | 'width', rect: Rect) => void
 }) {
   const node = useRef<HTMLDivElement>(null)
@@ -530,7 +701,13 @@ function TextItem({
     fontSize: `calc(var(--u) * ${TEXT_SIZE[text.size]})`,
     color: TEXT_COLOR[text.color],
   } as CSSProperties
-  const classes = ['free-text', editor && 'free-text--editable', selected && 'item--selected', editing && 'free-text--editing']
+  const classes = [
+    'free-text',
+    editor && 'free-text--editable',
+    (selected || grouped) && 'item--selected',
+    editing && 'free-text--editing',
+    text.locked && 'item--locked',
+  ]
 
   return (
     <div
@@ -540,7 +717,7 @@ function TextItem({
       data-item={`t${text.id}`}
       data-keep-selection
       onPointerDown={editor && !editing ? (e) => onBegin(e, 'move', rectOf()) : undefined}
-      onDoubleClick={editor && (() => editor.onTextEdit(text.id))}
+      onDoubleClick={editor && !text.locked ? () => editor.onTextEdit(text.id) : undefined}
     >
       {editing ? (
         <span
@@ -559,9 +736,10 @@ function TextItem({
       ) : (
         text.text
       )}
-      {selected && !editing && (
+      {selected && !grouped && !editing && !text.locked && (
         <span className="handle handle--width edit-ui" onPointerDown={(e) => onBegin(e, 'width', rectOf())} />
       )}
+      {editor && text.locked && <span className="lock-badge edit-ui" aria-label="Locked">🔒</span>}
     </div>
   )
 }
@@ -627,6 +805,51 @@ function LayoutGuides({ spread }: { spread: boolean }) {
           style={{ top: pct(v) }}
         />
       ))}
+    </>
+  )
+}
+
+/**
+ * Page numbers and running head, set the same way on every inside page. On a
+ * spread the left page's go to its left edge and the right page's to its
+ * right: the outer corners, away from the fold.
+ */
+function PageFolios({ pages, numbers, position, running }: NonNullable<Props['folios']>) {
+  const width = 1 / pages.length
+  const top = position === 'top-outer'
+  return (
+    <>
+      {pages.map((n, i) => {
+        // The right-hand page of a spread (or a lone page) has its outer edge on the right.
+        const outerRight = pages.length === 1 || i === 1
+        const side = (inner: boolean): CSSProperties =>
+          outerRight !== inner
+            ? { right: pct(1 - (i + 1) * width + width * 0.07), textAlign: 'right' }
+            : { left: pct(i * width + width * 0.07) }
+        return (
+          <div key={i}>
+            {numbers && (
+              <div
+                className="folio"
+                style={{
+                  ...(position === 'bottom-centre'
+                    ? { left: pct(i * width), width: pct(width), textAlign: 'center' }
+                    : side(false)),
+                  ...(top ? { top: '4%' } : { bottom: '4%' }),
+                }}
+              >
+                {n}
+              </div>
+            )}
+            {running && (
+              // Top of the page; on the inner side if the numbers already have the outer top corner.
+              <div className="folio folio--running" style={{ ...side(numbers && top), top: '4%' }}>
+                {running}
+              </div>
+            )}
+          </div>
+        )
+      })}
     </>
   )
 }

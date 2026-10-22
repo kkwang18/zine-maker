@@ -1,41 +1,69 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { readDrag } from './components/dragItem'
 import { FlipText } from './components/FlipText'
-import { PhotoToolbar, TextToolbar } from './components/ItemToolbar'
+import { PhotoToolbar, ShapeToolbar, TextToolbar } from './components/ItemToolbar'
 import { LayoutPicker } from './components/LayoutPicker'
 import { PageActions } from './components/PageActions'
 import { PhotoTray } from './components/PhotoTray'
 import { Preview } from './components/Preview'
 import { SurfaceView, type SurfaceEditor } from './components/SurfaceView'
 import { forget, loadPhoto, showable, stored } from './lib/analyze'
+import { ArrangeBar, type Units } from './components/ArrangeBar'
 import {
   addFree,
+  addShape,
   addText,
+  alignRects,
+  distributeRects,
+  duplicate,
+  isLocked,
+  placeItem,
+  setLocked,
+  type Align,
+  type Layer,
   moveFrame,
   moveFree,
   moveSpread,
   placePhoto,
   removePhoto as withoutPhoto,
+  removeShape,
   removeSpread,
   removeText,
   renderDraft,
   resetFrame,
   restack,
+  setFrameShape,
   setSurfaceColor,
   swapPhotos,
   takeOff,
+  updateShape,
   updateText,
   type PhotoRef,
 } from './lib/draft'
 import { carouselPosts } from './lib/carousel'
+import { pageInches, preflight, type ExportTarget, type Issue } from './lib/preflight'
 import { clearSaved, deletePhoto, loadSaved, savePhotos, saveState } from './lib/persist'
 import { PAPER, pageAspect } from './lib/geometry'
 import { findLayout, hasCircles, withoutCircles } from './lib/layouts'
 import { fillEmptySlots, insertSpread, lookAlikes, MIN_PHOTOS, relayout, sequence } from './lib/sequence'
-import { NEW_DOC, type Doc } from './lib/doc'
+import { NEW_DOC, upgradeDoc, type Doc, type Folios } from './lib/doc'
 import { PAGE_COLORS, STYLES, TITLE_FONTS } from './lib/styles'
 import { useHistory } from './lib/useHistory'
-import type { Draft, FreeText, PageColor, PaperSize, Photo, SlotAddress, TextKind, TitleFont, ZineStyle } from './lib/types'
+import type {
+  Draft,
+  FreeText,
+  PageColor,
+  PaperSize,
+  Photo,
+  Rect,
+  Shape,
+  ShapeKind,
+  SlotAddress,
+  SurfaceKind,
+  TextKind,
+  TitleFont,
+  ZineStyle,
+} from './lib/types'
 import './App.css'
 
 const THIS_MONTH = new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
@@ -46,11 +74,12 @@ const THIS_MONTH = new Date().toLocaleDateString('en-US', { month: 'long', year:
  */
 const MAX_SPREADS = 31
 
-/** What's selected: a photo or empty slot on a page, a photo in the tray, or a text box. */
+/** What's selected: a photo or empty slot on a page, a photo in the tray, a shape or a text box. */
 type Selection =
   | { type: 'slot'; at: SlotAddress }
   | { type: 'free'; surface: number; id: string }
   | { type: 'photo'; id: string }
+  | { type: 'shape'; surface: number; id: string }
   | { type: 'text'; surface: number; id: string }
 
 /** Typing in a field or a text box shouldn't trigger page shortcuts. */
@@ -88,7 +117,7 @@ function App() {
   const [failed, setFailed] = useState<string[]>([])
   // Everything undo can step through.
   const history = useHistory<Doc>(NEW_DOC)
-  const { title, byline, backText, paper, zineStyle, pageColor, circles, titleFont, variant, manual } = history.present
+  const { title, byline, backText, paper, zineStyle, pageColor, circles, titleFont, variant, manual, folios } = history.present
   /** Change the zine as one undo step; `mergeKey` folds quick repeats (typing) into one. */
   const change = (patch: Partial<Doc>, mergeKey?: string) => history.update((d) => ({ ...d, ...patch }), mergeKey)
   const setManual = (next: Draft | null) => change({ manual: next })
@@ -96,6 +125,8 @@ function App() {
   // Waiting for a second photo or slot to swap with.
   const [swapFrom, setSwapFrom] = useState<PhotoRef | null>(null)
   const [editingText, setEditingText] = useState<string | null>(null)
+  // Several items selected together on one page (Shift-click), to align, space or move as one.
+  const [group, setGroup] = useState<{ surface: number; layers: Layer[] } | null>(null)
   const [dragging, setDragging] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [exportError, setExportError] = useState('')
@@ -105,6 +136,11 @@ function App() {
   const [shareFile, setShareFile] = useState<File | null>(null)
   const [sharing, setSharing] = useState(false)
   const [shareNote, setShareNote] = useState('')
+  // Preflight: the issues for the current destination, and whether the panel is open
+  // (with `pending` set when it's standing between someone and a download).
+  const [issues, setIssues] = useState<Issue[]>([])
+  const [checking, setChecking] = useState<{ target: ExportTarget; pending: boolean } | null>(null)
+  const [downloadMenu, setDownloadMenu] = useState(false)
   // Autosave: nothing is written until the last session has been read back in.
   const [ready, setReady] = useState(false)
   const [saveNote, setSaveNote] = useState('')
@@ -133,7 +169,7 @@ function App() {
       .then((saved) => {
         if (!saved) return
         setPhotos(saved.photos.map(showable))
-        history.reset(saved.doc)
+        history.reset(upgradeDoc(saved.doc))
         if (saved.photos.length) setSaveNote('Picked up where you left off.')
       })
       .catch(() => setSaveNote('Couldn’t read your last session.'))
@@ -156,11 +192,119 @@ function App() {
     if (draft) setManual(change(draft))
     setSelected(keep)
     setSwapFrom(null)
+    setGroup(null)
   }
 
   const deselect = () => {
     setSelected(null)
     setSwapFrom(null)
+    setGroup(null)
+  }
+
+  // ── Items as layers: for multiple selection and the precise tools ──
+
+  const keyOf = (l: Layer) => (l.type === 'slot' ? `s${l.slot}` : `${{ free: 'f', shape: 'h', text: 't' }[l.type]}${l.id}`)
+
+  const layerOf = (sel: Selection | null): { surface: number; layer: Layer } | null => {
+    if (sel?.type === 'slot') return { surface: sel.at.surface, layer: { type: 'slot', slot: sel.at.slot } }
+    if (sel?.type === 'free') return { surface: sel.surface, layer: { type: 'free', id: sel.id } }
+    if (sel?.type === 'shape') return { surface: sel.surface, layer: { type: 'shape', id: sel.id } }
+    if (sel?.type === 'text') return { surface: sel.surface, layer: { type: 'text', id: sel.id } }
+    return null
+  }
+
+  const selectionOf = (surface: number, l: Layer): Selection =>
+    l.type === 'slot' ? { type: 'slot', at: { surface, slot: l.slot } } : { type: l.type, surface, id: l.id }
+
+  /** What the arranging tools act on: the multiple selection, or the one selected item. */
+  const active = (): { surface: number; layers: Layer[] } | null => {
+    if (group) return group
+    const one = layerOf(selected)
+    return one ? { surface: one.surface, layers: [one.layer] } : null
+  }
+
+  /** An item's position and size as drawn (surface fractions); text boxes need measuring. */
+  const measureRect = (surface: number, l: Layer): Rect | null => {
+    const surfaceEl = book.current?.querySelectorAll<HTMLElement>('.surface')[surface]
+    const el = surfaceEl?.querySelector<HTMLElement>(`[data-item="${keyOf(l)}"]`)
+    if (!surfaceEl || !el) return null
+    const b = surfaceEl.getBoundingClientRect()
+    const r = el.getBoundingClientRect()
+    return { x: (r.left - b.left) / b.width, y: (r.top - b.top) / b.height, w: r.width / b.width, h: r.height / b.height }
+  }
+
+  /** Move several items to new rects as one undo step, skipping locked ones; the selection stays. */
+  const placeAll = (surface: number, moves: { layer: Layer; rect: Rect }[], mergeKey?: string) => {
+    if (!draft) return
+    let next = draft
+    for (const { layer, rect } of moves) if (!isLocked(next, surface, layer)) next = placeItem(next, surface, layer, rect)
+    change({ manual: next }, mergeKey)
+  }
+
+  /** Shift-click: add an item to the multiple selection, or take it out. */
+  const toggleGroup = (surface: number, layer: Layer) => {
+    const current = layerOf(selected)
+    const base = group?.surface === surface ? group.layers : current?.surface === surface ? [current.layer] : []
+    const has = base.some((l) => keyOf(l) === keyOf(layer))
+    const next = has ? base.filter((l) => keyOf(l) !== keyOf(layer)) : [...base, layer]
+    setSwapFrom(null)
+    if (next.length > 1) {
+      setGroup({ surface, layers: next })
+      setSelected(null)
+    } else {
+      setGroup(null)
+      setSelected(next[0] ? selectionOf(surface, next[0]) : null)
+    }
+  }
+
+  /** Real units for a surface: inches (Letter), millimetres (A4) or pixels (Instagram). */
+  const unitsFor = (kind: SurfaceKind): Units => {
+    const pages = kind === 'spread' ? 2 : 1
+    if (paper === 'instagram') return { name: 'px', decimals: 0, width: 1080 * pages, height: 1350 }
+    const page = pageInches(paper, 'home', spreadCount)
+    const per = paper === 'a4' ? 25.4 : 1
+    return { name: paper === 'a4' ? 'mm' : 'in', decimals: paper === 'a4' ? 1 : 2, width: page.w * pages * per, height: page.h * per }
+  }
+
+  /** The page an item sits on (its centre decides, on a spread), for aligning one thing to its page. */
+  const pageAround = (kind: SurfaceKind, r: Rect): Rect =>
+    kind !== 'spread' ? { x: 0, y: 0, w: 1, h: 1 } : r.x + r.w / 2 < 0.5 ? { x: 0, y: 0, w: 0.5, h: 1 } : { x: 0.5, y: 0, w: 0.5, h: 1 }
+
+  const alignActive = (how: Align) => {
+    const a = active()
+    if (!a) return
+    const rects = a.layers.map((l) => measureRect(a.surface, l))
+    if (rects.some((r) => !r)) return
+    const bounds = a.layers.length === 1 ? pageAround(surfaces[a.surface].kind, rects[0]!) : undefined
+    const aligned = alignRects(rects as Rect[], how, bounds)
+    placeAll(a.surface, a.layers.map((layer, i) => ({ layer, rect: aligned[i] })))
+  }
+
+  const distributeActive = (axis: 'x' | 'y') => {
+    const a = active()
+    if (!a || a.layers.length < 3) return
+    const rects = a.layers.map((l) => measureRect(a.surface, l))
+    if (rects.some((r) => !r)) return
+    const spaced = distributeRects(rects as Rect[], axis)
+    placeAll(a.surface, a.layers.map((layer, i) => ({ layer, rect: spaced[i] })))
+  }
+
+  const duplicateActive = () => {
+    const one = group ? null : layerOf(selected)
+    const rect = one && measureRect(one.surface, one.layer)
+    if (!draft || !one || !rect) return
+    const { draft: next, item } = duplicate(draft, one.surface, one.layer, rect)
+    setManual(next)
+    setSelected(selectionOf(one.surface, item))
+  }
+
+  const lockActive = () => {
+    const a = active()
+    if (!a || !draft) return
+    const lock = !a.layers.every((l) => isLocked(draft, a.surface, l))
+    let next = draft
+    for (const l of a.layers) next = setLocked(next, a.surface, l, lock)
+    change({ manual: next })
   }
 
   /** The photo spot a selection points at, if it's a photo on a page. */
@@ -180,6 +324,7 @@ function App() {
     } else if (selected?.type === 'photo') {
       edit((d) => placePhoto(d, selected.id, ref), ref)
     } else {
+      setGroup(null)
       setSelected(current && sameRef(current, ref) ? null : ref)
     }
   }
@@ -207,9 +352,12 @@ function App() {
     selectedSlot: selected?.type === 'slot' && selected.at.surface === surface ? selected.at.slot : null,
     selectedFree: selected?.type === 'free' && selected.surface === surface ? selected.id : null,
     selectedText: selected?.type === 'text' && selected.surface === surface ? selected.id : null,
+    selectedShape: selected?.type === 'shape' && selected.surface === surface ? selected.id : null,
     editingText: typingIn,
+    groupKeys: group?.surface === surface ? group.layers.map(keyOf) : [],
     swapping: swapFrom !== null,
-    onSlotClick: (slot) => clickRef({ type: 'slot', at: { surface, slot } }),
+    onSlotClick: (slot, additive) =>
+      additive ? toggleGroup(surface, { type: 'slot', slot }) : clickRef({ type: 'slot', at: { surface, slot } }),
     onSlotDrop: (slot, e) => {
       const item = readDrag(e)
       const at: PhotoRef = { type: 'slot', at: { surface, slot } }
@@ -217,7 +365,8 @@ function App() {
     },
     onFrameChange: (slot, box) =>
       edit((d) => moveFrame(d, { surface, slot }, box), { type: 'slot', at: { surface, slot } }),
-    onFreeClick: (id) => clickRef({ type: 'free', surface, id }),
+    onFreeClick: (id, additive) =>
+      additive ? toggleGroup(surface, { type: 'free', id }) : clickRef({ type: 'free', surface, id }),
     onFreeDrop: (id, e) => {
       const item = readDrag(e)
       const at: PhotoRef = { type: 'free', surface, id }
@@ -228,9 +377,30 @@ function App() {
       const item = readDrag(e)
       if (item) placeFreely(surface, item.id, point)
     },
-    onTextClick: (id) => {
+    onTextClick: (id, additive) => {
+      if (additive) return toggleGroup(surface, { type: 'text', id })
       setSwapFrom(null)
+      setGroup(null)
       setSelected({ type: 'text', surface, id })
+    },
+    onShapeClick: (id, additive) => {
+      if (additive) return toggleGroup(surface, { type: 'shape', id })
+      setSwapFrom(null)
+      setGroup(null)
+      setSelected(selected?.type === 'shape' && selected.id === id ? null : { type: 'shape', surface, id })
+    },
+    onShapeChange: (id, box) => edit((d) => updateShape(d, surface, id, { box }), { type: 'shape', surface, id }),
+    onGroupMove: (dx, dy) => {
+      if (!group) return
+      const moves = group.layers.flatMap((layer) => {
+        const r = measureRect(surface, layer)
+        return r ? [{ layer, rect: { ...r, x: r.x + dx, y: r.y + dy } }] : []
+      })
+      placeAll(surface, moves)
+    },
+    measure: (r) => {
+      const u = unitsFor(surfaces[surface].kind)
+      return `${(r.w * u.width).toFixed(u.decimals)} × ${(r.h * u.height).toFixed(u.decimals)} ${u.name}`
     },
     onTextEdit: (id) => {
       setSelected({ type: 'text', surface, id })
@@ -252,6 +422,21 @@ function App() {
     setSelected({ type: 'text', surface, id })
     setEditingText(id)
   }
+
+  /** A new shape, in a colour that shows up on its page; selected so it can be placed. */
+  const addShapeTo = (surface: number, kind: ShapeKind) => {
+    if (!draft) return
+    const page = surfaces[surface].color ?? pageColor
+    const color: PageColor = kind === 'line' ? (page === 'black' ? 'white' : 'black') : page === 'yellow' ? 'sky' : 'yellow'
+    const { draft: next, id } = addShape(draft, surface, kind, color, surfaces[surface].aspect)
+    setManual(next)
+    setGroup(null)
+    setSelected({ type: 'shape', surface, id })
+  }
+
+  /** The shape currently selected, if any. */
+  const selectedShape: Shape | undefined =
+    selected?.type === 'shape' ? draft?.[selected.surface]?.shapes?.find((f) => f.id === selected.id) : undefined
 
   /** The text box currently selected, if any. */
   const selectedText: FreeText | undefined =
@@ -346,28 +531,62 @@ function App() {
   }
 
   /** The print PDF, or Instagram slides, depending on the format. */
-  const downloadZine = async () => {
+  /** Where things go by default: Instagram slides, or the home-printer PDF. */
+  const defaultTarget: ExportTarget = paper === 'instagram' ? 'instagram' : 'home'
+
+  // Re-check after every change. Text is measured from the page, so this runs after it's drawn.
+  useEffect(() => {
+    if (!book.current) return setIssues([])
+    setIssues(preflight(book.current, surfaces, byId, paper, checking?.target ?? defaultTarget))
+  }, [surfaces, byId, paper, checking?.target, defaultTarget, title, byline, backText])
+
+  const warnings = issues.filter((i) => i.severity === 'warn').length
+
+  /** Check first; if anything looks wrong, show it before downloading. */
+  const requestDownload = (target: ExportTarget) => {
+    setDownloadMenu(false)
+    if (!book.current) return
+    const found = preflight(book.current, surfaces, byId, paper, target)
+    if (found.some((i) => i.severity === 'warn')) {
+      setIssues(found)
+      setChecking({ target, pending: true })
+    } else downloadZine(target)
+  }
+
+  /** The home-printer PDF, the print-shop PDF, or Instagram slides. */
+  const downloadZine = async (target: ExportTarget) => {
     if (!book.current) return
     deselect()
+    setChecking(null)
     setExporting(true)
     setExportError('')
     try {
       // Let the cleared selection render first, so no outline ends up in the pictures.
       await nextFrame()
       // The exporters are only loaded when first used, to keep the app quick to open.
-      if (paper === 'instagram') {
+      if (target === 'instagram') {
         const { renderSlides, zipSlides } = await import('./lib/exportSlides')
         const perSurface = surfaces.map((s) => (s.kind === 'spread' ? 2 : 1))
         download(await zipSlides(await renderSlides(book.current), perSurface), `${fileName}-instagram.zip`)
-      } else {
-        const { renderPrintPdf } = await import('./lib/exportPdf')
-        download(await renderPrintPdf(book.current, paper, title.trim()), `${fileName}-print.pdf`)
+      } else if (paper !== 'instagram') {
+        const { renderPrintPdf, renderShopPdf } = await import('./lib/exportPdf')
+        if (target === 'shop') download(await renderShopPdf(book.current, paper, title.trim()), `${fileName}-print-shop.pdf`)
+        else download(await renderPrintPdf(book.current, paper, title.trim()), `${fileName}-print.pdf`)
       }
     } catch (err) {
       setExportError(err instanceof Error ? err.message : String(err))
     } finally {
       setExporting(false)
     }
+  }
+
+  /** Jump to a problem: scroll its page into view and select the thing at fault. */
+  const showIssue = (issue: Issue) => {
+    book.current?.querySelectorAll('.book__row')[issue.surface]?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    const it = issue.item
+    if (!it) return deselect()
+    if (it.type === 'slot') setSelected({ type: 'slot', at: { surface: issue.surface, slot: it.slot } })
+    else setSelected({ type: it.type, surface: issue.surface, id: it.id })
   }
 
   // ── Saving ────────────────────────────────────────────────────────────────
@@ -411,7 +630,7 @@ function App() {
     try {
       const { openProject } = await import('./lib/project')
       const project = await openProject(file)
-      await replaceAll(project.doc, project.photos.map(showable))
+      await replaceAll(upgradeDoc(project.doc), project.photos.map(showable))
       setSaveNote(`Opened ${file.name}.`)
     } catch (err) {
       setSaveNote(`Couldn’t open that file: ${err instanceof Error ? err.message : err}`)
@@ -484,13 +703,25 @@ function App() {
         setSwapFrom(null)
         return
       }
-      if (!selected || selected.type === 'photo') return
+      if (mod && e.key.toLowerCase() === 'd') {
+        e.preventDefault()
+        duplicateActive()
+        return
+      }
+      const a = active()
+      if (!a) return
       if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault()
-        setManual(
-          selected.type === 'text' ? removeText(draft, selected.surface, selected.id) : takeOff(draft, selected),
-        )
-        setSelected(null)
+        // Locked items stay put.
+        let next = draft
+        for (const l of a.layers) {
+          if (isLocked(next, a.surface, l)) continue
+          if (l.type === 'text') next = removeText(next, a.surface, l.id)
+          else if (l.type === 'shape') next = removeShape(next, a.surface, l.id)
+          else next = takeOff(next, l.type === 'slot' ? { type: 'slot', at: { surface: a.surface, slot: l.slot } } : { type: 'free', surface: a.surface, id: l.id })
+        }
+        setManual(next)
+        deselect()
         return
       }
       const step = e.shiftKey ? 0.02 : 0.004
@@ -498,17 +729,12 @@ function App() {
       if (!delta) return
       e.preventDefault()
       const [dx, dy] = delta
-      if (selected.type === 'text') {
-        const t = draft[selected.surface].texts?.find((x) => x.id === selected.id)
-        // A run of nudges is one undo step.
-        if (t) change({ manual: updateText(draft, selected.surface, t.id, { x: t.x + dx, y: t.y + dy }) }, 'nudge')
-      } else if (selected.type === 'free') {
-        const dest = renderDraft(draft, byId, paper)[selected.surface].free.find((f) => f.id === selected.id)?.placement.dest
-        if (dest) change({ manual: moveFree(draft, selected.surface, selected.id, { ...dest, x: dest.x + dx, y: dest.y + dy }) }, 'nudge')
-      } else {
-        const dest = renderDraft(draft, byId, paper)[selected.at.surface].slots[selected.at.slot].placement?.dest
-        if (dest) change({ manual: moveFrame(draft, selected.at, { ...dest, x: dest.x + dx, y: dest.y + dy }) }, 'nudge')
-      }
+      // A run of nudges is one undo step.
+      const moves = a.layers.flatMap((layer) => {
+        const r = measureRect(a.surface, layer)
+        return r ? [{ layer, rect: { ...r, x: r.x + dx, y: r.y + dy } }] : []
+      })
+      placeAll(a.surface, moves, 'nudge')
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -695,6 +921,52 @@ function App() {
           </label>
         </Section>
 
+        <Section title="Page numbers">
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={folios.numbers}
+              onChange={() => change({ folios: { ...folios, numbers: !folios.numbers } })}
+            />
+            <span className="toggle__track" aria-hidden="true" />
+            <span className="toggle__text">
+              <strong>Number the pages</strong>
+              <span>On every inside page; the covers stay clean.</span>
+            </span>
+          </label>
+          {folios.numbers && (
+            <div className="pills" role="radiogroup" aria-label="Where page numbers go">
+              {(
+                [
+                  ['bottom-outer', 'Bottom corner'],
+                  ['bottom-centre', 'Bottom centre'],
+                  ['top-outer', 'Top corner'],
+                ] as [Folios['position'], string][]
+              ).map(([value, label]) => (
+                <button
+                  key={value}
+                  role="radio"
+                  aria-checked={folios.position === value}
+                  className="pill pill--small"
+                  aria-pressed={folios.position === value}
+                  onClick={() => change({ folios: { ...folios, position: value } })}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
+          <label className="field">
+            <span>Running head</span>
+            <input
+              value={folios.running}
+              maxLength={60}
+              placeholder="Repeated at the top of every page"
+              onChange={(e) => change({ folios: { ...folios, running: e.target.value } }, 'running')}
+            />
+          </label>
+        </Section>
+
         <Section title="Back">
           <label className="field">
             <span>Text</span>
@@ -785,9 +1057,84 @@ function App() {
             <button className="pill" disabled={sharing} onClick={prepareShare} title="A PDF to read on screen, for sending to people">
               {sharing ? 'Preparing…' : 'Share'}
             </button>
-            <button className="pill pill--solid" disabled={exporting} onClick={downloadZine}>
-              {exporting ? 'Making…' : paper === 'instagram' ? 'Download slides' : 'Download PDF'}
+            <button
+              className="pill"
+              aria-expanded={Boolean(checking)}
+              onClick={() => setChecking(checking ? null : { target: defaultTarget, pending: false })}
+              title="Check for problems before printing or posting"
+            >
+              Check{warnings > 0 && <span className="badge">{warnings}</span>}
             </button>
+            <button
+              className="pill pill--solid"
+              disabled={exporting}
+              aria-expanded={downloadMenu}
+              onClick={() => (paper === 'instagram' ? requestDownload('instagram') : setDownloadMenu(!downloadMenu))}
+            >
+              {exporting ? 'Making…' : paper === 'instagram' ? 'Download slides' : 'Download PDF ▾'}
+            </button>
+            {downloadMenu && (
+              <div className="share-panel download-menu" role="menu">
+                <button role="menuitem" className="download-option" onClick={() => requestDownload('home')}>
+                  <strong>For a home printer</strong>
+                  <span>
+                    {spreadCount === 3
+                      ? 'One sheet, laid out to fold into the zine, with a folding guide.'
+                      : 'Double-sided sheets to stack, fold and staple, with instructions.'}
+                  </span>
+                </button>
+                <button role="menuitem" className="download-option" onClick={() => requestDownload('shop')}>
+                  <strong>For a print shop</strong>
+                  <span>
+                    Single pages at {paper === 'a4' ? 'A5' : 'half-letter'} size with bleed and crop marks, ready to
+                    print, trim and staple.
+                  </span>
+                </button>
+              </div>
+            )}
+            {checking && (
+              <div className="share-panel preflight" role="status">
+                <p>
+                  <strong>
+                    {issues.length === 0
+                      ? 'All clear.'
+                      : `${warnings} to fix, ${issues.length - warnings} to look at`}
+                  </strong>{' '}
+                  Checked for {checking.target === 'shop' ? 'a print shop' : checking.target === 'home' ? 'a home printer' : 'Instagram'}.
+                </p>
+                {paper !== 'instagram' && !checking.pending && (
+                  <div className="pills">
+                    {(['home', 'shop'] as const).map((t) => (
+                      <button key={t} className="pill pill--small" aria-pressed={checking.target === t} onClick={() => setChecking({ target: t, pending: false })}>
+                        {t === 'home' ? 'Home printer' : 'Print shop'}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {issues.length > 0 && (
+                  <ul className="issues">
+                    {issues.map((issue, i) => (
+                      <li key={i} className={`issue issue--${issue.severity}`}>
+                        <span>{issue.message}</span>
+                        <button className="pill pill--small" onClick={() => showIssue(issue)}>
+                          Show
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <div className="pills">
+                  {checking.pending && (
+                    <button className="pill pill--solid" onClick={() => downloadZine(checking.target)}>
+                      Download anyway
+                    </button>
+                  )}
+                  <button className="pill" onClick={() => setChecking(null)}>
+                    {checking.pending ? 'Fix first' : 'Close'}
+                  </button>
+                </div>
+              </div>
+            )}
             {(shareFile || shareNote) && (
               <div className="share-panel" role="status">
                 {shareFile ? (
@@ -832,6 +1179,7 @@ function App() {
                   ? ({ type: 'free', id: freeSelected.id } as const)
                   : null
               const textSelected = selected?.type === 'text' && selected.surface === i ? selectedText : undefined
+              const shapeSelected = selected?.type === 'shape' && selected.surface === i ? selectedShape : undefined
               return (
                 // Keyed by position: spreads keep their place in the list as they're reordered.
                 <figure key={i} className={`book__row book__row--${surface.kind}`}>
@@ -844,6 +1192,11 @@ function App() {
                     onWordsClick={editText}
                     seam={PAPER[paper].print ? 'fold' : 'slides'}
                     showGuides={showGuides}
+                    folios={
+                      surface.kind === 'spread' && (folios.numbers || folios.running.trim())
+                        ? { ...folios, running: folios.running.trim(), pages: [i * 2, i * 2 + 1] }
+                        : undefined
+                    }
                   />
                   <figcaption>
                     <div className="caption-row">
@@ -857,20 +1210,71 @@ function App() {
                         canRemove={spreadCount > 1}
                         onMove={(by) => edit((d) => moveSpread(d, i, by))}
                         onAddText={() => addTextTo(i)}
+                        onAddShape={(kind) => addShapeTo(i, kind)}
                         onColor={(c) => edit((d) => setSurfaceColor(d, i, c))}
                         onAddSpread={() => edit((d) => insertSpread(d, i + 1, photos, paper, zineStyle, circles))}
                         onRemove={() => edit((d) => removeSpread(d, i))}
                       />
                     </div>
+                    {(() => {
+                      // The precise tools: for a multiple selection here, or the one item selected here.
+                      const many = group?.surface === i ? group : null
+                      const one = !many ? layerOf(selected) : null
+                      if (!many && one?.surface !== i) return null
+                      const l = one?.layer
+                      const rect: Rect | null = !l
+                        ? null
+                        : l.type === 'slot'
+                          ? (surface.slots[l.slot].placement?.dest ?? null)
+                          : l.type === 'free'
+                            ? (surface.free.find((f) => f.id === l.id)?.placement.dest ?? null)
+                            : l.type === 'shape'
+                              ? (surface.shapes.find((f) => f.id === l.id)?.box ?? null)
+                              : (() => {
+                                const t = surface.texts.find((x) => x.id === l.id)
+                                // A text box's height follows its words, so it isn't shown.
+                                return t ? { x: t.x, y: t.y, w: t.w, h: Number.NaN } : null
+                              })()
+                      if (!many && !rect) return null
+                      const layers = many ? many.layers : [l!]
+                      return (
+                        <ArrangeBar
+                          units={unitsFor(surface.kind)}
+                          rect={rect}
+                          kind={many ? 'group' : l!.type === 'text' || l!.type === 'shape' ? l!.type : 'photo'}
+                          count={layers.length}
+                          locked={layers.every((x) => isLocked(draft, i, x))}
+                          onPlace={(r) => placeAll(i, [{ layer: l!, rect: { ...r, h: Number.isNaN(r.h) ? 0 : r.h } }])}
+                          onAlign={alignActive}
+                          onDistribute={distributeActive}
+                          onDuplicate={duplicateActive}
+                          onLock={lockActive}
+                        />
+                      )
+                    })()}
                     {photoSelected && layer && (
                       <PhotoToolbar
                         moved={Boolean(slot?.moved)}
                         swapping={swapFrom !== null}
+                        shape={
+                          (slot ? slot.placement?.shape : surface.free.find((f) => f.id === freeSelected?.id)?.placement.shape) ??
+                          'plain'
+                        }
+                        onShape={(shape) => edit((d) => setFrameShape(d, photoSelected, shape), selected)}
                         onSwap={() => setSwapFrom(photoSelected)}
                         onFront={() => edit((d) => restack(d, i, layer, 'front'), selected)}
                         onBack={() => edit((d) => restack(d, i, layer, 'back'), selected)}
                         onReset={() => slotSelected && edit((d) => resetFrame(d, slotSelected), selected)}
                         onRemove={() => edit((d) => takeOff(d, photoSelected))}
+                      />
+                    )}
+                    {shapeSelected && (
+                      <ShapeToolbar
+                        shape={shapeSelected}
+                        onChange={(change) => edit((d) => updateShape(d, i, shapeSelected.id, change), selected)}
+                        onFront={() => edit((d) => restack(d, i, { type: 'shape', id: shapeSelected.id }, 'front'), selected)}
+                        onBack={() => edit((d) => restack(d, i, { type: 'shape', id: shapeSelected.id }, 'back'), selected)}
+                        onRemove={() => edit((d) => removeShape(d, i, shapeSelected.id))}
                       />
                     )}
                     {textSelected && (
